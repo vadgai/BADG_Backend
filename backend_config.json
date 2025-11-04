@@ -1,0 +1,117 @@
+{
+  "apiVersion": "serving.knative.dev/v1",
+  "kind": "Service",
+  "metadata": {
+    "annotations": {
+      "run.googleapis.com/build-enable-automatic-updates": "false",
+      "run.googleapis.com/build-id": "4d253748-c011-4b21-834a-fd50ba00ca00",
+      "run.googleapis.com/build-image-uri": "asia-south1-docker.pkg.dev/positive-shell-475102-t5/cloud-run-source-deploy/vadg-backend",
+      "run.googleapis.com/build-name": "projects/258229345811/locations/asia-south1/builds/4d253748-c011-4b21-834a-fd50ba00ca00",
+      "run.googleapis.com/build-source-location": "gs://run-sources-positive-shell-475102-t5-asia-south1/services/vadg-backend/1761149733.289436-1d51616a6fb34ad6ae2cc014c9f81b3a.zip#1761149740850788",
+      "run.googleapis.com/client-name": "gcloud",
+      "run.googleapis.com/client-version": "542.0.0",
+      "run.googleapis.com/ingress": "all",
+      "run.googleapis.com/ingress-status": "all",
+      "run.googleapis.com/operation-id": "9556676d-8674-4072-bc75-be8827a838a9",
+      "run.googleapis.com/urls": "[\"https://vadg-backend-258229345811.asia-south1.run.app\",\"https://vadg-backend-ld6xrzhwvq-el.a.run.app\"]",
+      "serving.knative.dev/creator": "wordtheme44@gmail.com",
+      "serving.knative.dev/lastModifier": "wordtheme44@gmail.com"
+    },
+    "creationTimestamp": "2025-10-14T02:57:49.784662Z",
+    "generation": 3,
+    "labels": {
+      "cloud.googleapis.com/location": "asia-south1",
+      "run.googleapis.com/satisfiesPzs": "true"
+    },
+    "name": "vadg-backend",
+    "namespace": "258229345811",
+    "resourceVersion": "AAZBwbSKb2s",
+    "selfLink": "/apis/serving.knative.dev/v1/namespaces/258229345811/services/vadg-backend",
+    "uid": "7c80e897-3f59-484e-a227-3874ae469121"
+  },
+  "spec": {
+    "template": {
+      "metadata": {
+        "annotations": {
+          "autoscaling.knative.dev/maxScale": "20",
+          "run.googleapis.com/client-name": "gcloud",
+          "run.googleapis.com/client-version": "542.0.0",
+          "run.googleapis.com/startup-cpu-boost": "true"
+        },
+        "labels": {
+          "client.knative.dev/nonce": "ittfcttsak",
+          "run.googleapis.com/startupProbeType": "Default"
+        }
+      },
+      "spec": {
+        "containerConcurrency": 80,
+        "containers": [
+          {
+            "image": "asia-south1-docker.pkg.dev/positive-shell-475102-t5/cloud-run-source-deploy/vadg-backend@sha256:5c18bbb4071f7b8ac3ff03a760ddaba928675ddb93ad6d1762ef85168a82f347",
+            "ports": [
+              {
+                "containerPort": 8080,
+                "name": "http1"
+              }
+            ],
+            "resources": {
+              "limits": {
+                "cpu": "1000m",
+                "memory": "512Mi"
+              }
+            },
+            "startupProbe": {
+              "failureThreshold": 1,
+              "periodSeconds": 240,
+              "tcpSocket": {
+                "port": 8080
+              },
+              "timeoutSeconds": 240
+            }
+          }
+        ],
+        "serviceAccountName": "258229345811-compute@developer.gserviceaccount.com",
+        "timeoutSeconds": 300
+      }
+    },
+    "traffic": [
+      {
+        "latestRevision": true,
+        "percent": 100
+      }
+    ]
+  },
+  "status": {
+    "address": {
+      "url": "https://vadg-backend-ld6xrzhwvq-el.a.run.app"
+    },
+    "conditions": [
+      {
+        "lastTransitionTime": "2025-10-22T16:21:13.728875Z",
+        "status": "True",
+        "type": "Ready"
+      },
+      {
+        "lastTransitionTime": "2025-10-22T16:21:03.935403Z",
+        "status": "True",
+        "type": "ConfigurationsReady"
+      },
+      {
+        "lastTransitionTime": "2025-10-22T16:21:13.700080Z",
+        "status": "True",
+        "type": "RoutesReady"
+      }
+    ],
+    "latestCreatedRevisionName": "vadg-backend-00003-5vg",
+    "latestReadyRevisionName": "vadg-backend-00003-5vg",
+    "observedGeneration": 3,
+    "traffic": [
+      {
+        "latestRevision": true,
+        "percent": 100,
+        "revisionName": "vadg-backend-00003-5vg"
+      }
+    ],
+    "url": "https://vadg-backend-ld6xrzhwvq-el.a.run.app"
+  }
+}

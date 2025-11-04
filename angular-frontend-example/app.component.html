@@ -1,0 +1,115 @@
+<div class="medical-diagnosis-app">
+  <header class="app-header">
+    <h1>{{ title }}</h1>
+  </header>
+
+  <main>
+    <!-- Error message -->
+    <div *ngIf="error" class="error-container">
+      <p class="error-message">{{ error }}</p>
+      <button (click)="dismissError()" class="dismiss-button">Dismiss</button>
+    </div>
+
+    <!-- Patient Form View -->
+    <div *ngIf="currentView === 'input'" class="patient-form-container">
+      <h2>Enter Patient Information</h2>
+      <form [formGroup]="patientForm" (ngSubmit)="submitSymptoms()">
+        <div class="form-group">
+          <label for="name">Full Name</label>
+          <input 
+            type="text" 
+            id="name" 
+            formControlName="name"
+          >
+          <div *ngIf="patientForm.get('name')?.touched && patientForm.get('name')?.errors?.['required']" class="error-text">
+            Name is required
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="age">Age</label>
+          <input 
+            type="number" 
+            id="age" 
+            formControlName="age"
+          >
+          <div *ngIf="patientForm.get('age')?.touched && patientForm.get('age')?.errors?.['required']" class="error-text">
+            Age is required
+          </div>
+          <div *ngIf="patientForm.get('age')?.touched && patientForm.get('age')?.errors?.['min']" class="error-text">
+            Age must be a positive number
+          </div>
+          <div *ngIf="patientForm.get('age')?.touched && patientForm.get('age')?.errors?.['max']" class="error-text">
+            Age must be less than 120
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="gender">Gender</label>
+          <select 
+            id="gender" 
+            formControlName="gender"
+          >
+            <option value="">Select Gender</option>
+            <option value="male">Male</option>
+            <option value="female">Female</option>
+            <option value="other">Other</option>
+          </select>
+          <div *ngIf="patientForm.get('gender')?.touched && patientForm.get('gender')?.errors?.['required']" class="error-text">
+            Gender is required
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="symptoms">Describe Your Symptoms</label>
+          <textarea 
+            id="symptoms" 
+            formControlName="symptoms" 
+            rows="5"
+          ></textarea>
+          <div *ngIf="patientForm.get('symptoms')?.touched && patientForm.get('symptoms')?.errors?.['required']" class="error-text">
+            Symptoms are required
+          </div>
+          <div *ngIf="patientForm.get('symptoms')?.touched && patientForm.get('symptoms')?.errors?.['minlength']" class="error-text">
+            Please provide more details about your symptoms (at least 10 characters)
+          </div>
+        </div>
+
+        <button type="submit" class="submit-button">Start Diagnosis</button>
+      </form>
+    </div>
+
+    <!-- Follow-up Questions View -->
+    <div *ngIf="currentView === 'followup'" class="followup-container">
+      <h2>Follow-up Questions</h2>
+      <div *ngIf="question" class="question-container">
+        <p class="question">{{ question }}</p>
+        <div class="options-container">
+          <button 
+            *ngFor="let option of options" 
+            class="option-button"
+            (click)="submitAnswer(option.key)"
+          >
+            <span class="option-key">{{ option.key }}</span>
+            <span class="option-value">{{ option.value }}</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Diagnosis Complete View -->
+    <div *ngIf="currentView === 'complete'" class="complete-container">
+      <h2>Diagnosis Complete</h2>
+      <p>Thank you for using our Medical Diagnosis System.</p>
+      <p>Your diagnosis report is ready.</p>
+      <div class="actions">
+        <button (click)="downloadReport()" class="download-button">
+          Download Diagnosis Report
+        </button>
+        <button (click)="startNewDiagnosis()" class="new-diagnosis-button">
+          Start New Diagnosis
+        </button>
+      </div>
+    </div>
+  </main>
+</div> 

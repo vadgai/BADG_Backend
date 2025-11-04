@@ -1,0 +1,83 @@
+# ============================================
+# VADG Backend Requirements
+# Production-ready with pinned versions
+# ============================================
+
+# Core Web Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+
+# Data Validation
+pydantic==2.5.3
+
+# Environment & Configuration
+python-dotenv==1.0.0
+
+# Google AI & Cloud Services
+google-generativeai==0.3.2
+google-cloud-translate==3.15.1
+
+# MongoDB Database (Async)
+motor>=3.3.2
+pymongo>=4.6.1
+dnspython>=2.6.1
+
+# Security & Authentication
+PyJWT>=2.8.0
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
+
+# AI & NLP Libraries
+langchain==0.1.4
+groq==0.4.2
+
+# PDF Generation & Reports
+reportlab==4.0.9
+xhtml2pdf==0.2.13
+fpdf==1.7.2
+jinja2==3.1.3
+
+# NLP - SpaCy
+spacy==3.7.2
+# Note: Download model with: python -m spacy download en_core_web_sm
+# Optional scientific model: 
+# https://s3-us-west-2.amazonaws.com/ai2-s-scispacy/releases/v0.5.4/en_core_sci_sm-0.5.4.tar.gz
+
+# HTTP Client
+httpx==0.26.0
+aiohttp==3.9.1
+
+# Utilities
+python-dateutil==2.8.2
+pytz==2024.1
+
+# CORS Middleware (included in fastapi, but explicit for clarity)
+# starlette==0.35.1  # Already included with FastAPI
+
+# Development & Testing (optional, comment out for minimal production)
+# pytest==7.4.4
+# pytest-asyncio==0.23.3
+# pytest-cov==4.1.0
+# black==24.1.1
+# flake8==7.0.0
+# mypy==1.8.0
+
+# ============================================
+# Optional: Streamlit (if using for admin UI)
+# ============================================
+# streamlit==1.30.0
+
+# ============================================
+# Production Monitoring & Logging (optional)
+# ============================================
+# sentry-sdk[fastapi]==1.40.0
+# prometheus-client==0.19.0
+
+# ============================================
+# Notes:
+# - All versions are pinned for production stability
+# - Update regularly and test before deploying
+# - For development, create requirements-dev.txt
+# - Use virtual environment: python -m venv venv
+# ============================================

@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Generate Medical Report</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom font for better aesthetics */
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f0f4f8; /* Light blue-gray background */
+        }
+        /* Basic spinner animation */
+        .spinner {
+            border: 4px solid rgba(0, 0, 0, 0.1);
+            border-left-color: #3b82f6; /* Blue for the spinner */
+            border-radius: 50%;
+            width: 24px;
+            height: 24px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="flex items-center justify-center min-h-screen p-4">
+    <div class="bg-white p-8 rounded-xl shadow-lg w-full max-w-md">
+        <h1 class="text-3xl font-bold text-center text-gray-800 mb-6">Medical Report Generator</h1>
+
+        <div class="mb-5">
+            <label for="sessionId" class="block text-gray-700 text-sm font-semibold mb-2">Session ID:</label>
+            <input
+                type="text"
+                id="sessionId"
+                placeholder="Enter session ID (e.g., 12345)"
+                class="shadow-sm appearance-none border rounded-lg w-full py-3 px-4 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition duration-200 ease-in-out"
+            >
+        </div>
+
+        <button
+            id="generateReportBtn"
+            class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-lg focus:outline-none focus:shadow-outline transition duration-200 ease-in-out flex items-center justify-center space-x-2"
+        >
+            <span id="buttonText">Generate Report</span>
+            <div id="loadingSpinner" class="spinner hidden"></div>
+        </button>
+
+        <div id="messageContainer" class="mt-6 p-4 rounded-lg text-sm hidden" role="alert">
+            </div>
+    </div>
+
+    <script>
+        // Get references to DOM elements
+        const sessionIdInput = document.getElementById('sessionId');
+        const generateReportBtn = document.getElementById('generateReportBtn');
+        const buttonText = document.getElementById('buttonText');
+        const loadingSpinner = document.getElementById('loadingSpinner');
+        const messageContainer = document.getElementById('messageContainer');
+
+        // Function to display messages
+        function showMessage(message, type = 'info') {
+            messageContainer.textContent = message;
+            messageContainer.classList.remove('hidden', 'bg-green-100', 'text-green-800', 'bg-red-100', 'text-red-800', 'bg-blue-100', 'text-blue-800');
+            messageContainer.classList.add('block');
+
+            if (type === 'success') {
+                messageContainer.classList.add('bg-green-100', 'text-green-800');
+            } else if (type === 'error') {
+                messageContainer.classList.add('bg-red-100', 'text-red-800');
+            } else { // info
+                messageContainer.classList.add('bg-blue-100', 'text-blue-800');
+            }
+        }
+
+        // Function to clear messages
+        function clearMessage() {
+            messageContainer.textContent = '';
+            messageContainer.classList.add('hidden');
+        }
+
+        // Event listener for the button click
+        generateReportBtn.addEventListener('click', async () => {
+            const sessionId = sessionIdInput.value.trim();
+
+            // Validate session ID input
+            if (!sessionId) {
+                showMessage('Please enter a session ID.', 'error');
+                return;
+            }
+
+            // Show loading state
+            buttonText.textContent = 'Generating...';
+            loadingSpinner.classList.remove('hidden');
+            generateReportBtn.disabled = true; // Disable button during generation
+            clearMessage(); // Clear previous messages
+
+            try {
+                // Construct the API URL using window.location.origin for absolute path
+                const apiUrl = `https://medical-diagnosis-smwn.onrender.com/generate_report/${sessionId}`;
+
+                const response = await fetch(apiUrl);
+                if (response.ok) {
+                    const blob = await response.blob();
+                    const fileUrl = URL.createObjectURL(blob);
+                    const newWindow = window.open(fileUrl, '_blank');
+
+                    if (newWindow && newWindow.focus) {
+                        newWindow.focus();
+                        showMessage('Report generated successfully! Opening in a new tab.', 'success');
+                    } else {
+                        
+                        showMessage('Report generated successfully! Your browser blocked the pop-up, so the PDF is downloading.', 'info');
+                        const a = document.createElement('a');
+                        a.href = fileUrl;
+                        a.download = `medical_report_${sessionId}.pdf`; 
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                    }
+
+                    setTimeout(() => URL.revokeObjectURL(fileUrl), 1000);
+
+                } else {
+                    // If response is not OK, try to parse the error message from the backend
+                    let errorMessage = 'Failed to generate report.';
+                    try {
+                        const errorData = await response.json();
+                        errorMessage = errorData.detail || errorMessage;
+                    } catch (jsonError) {
+                        // If response is not JSON, get raw text for debugging
+                        const rawText = await response.text();
+                        console.error('Failed to parse error response as JSON. Raw response:', rawText);
+                        errorMessage = `Failed to generate report. Server responded with: ${response.status} ${response.statusText}. (Details in console)`;
+                    }
+                    showMessage(`Error: ${errorMessage}`, 'error');
+                }
+            } catch (error) {
+                // Catch network errors or other unexpected issues
+                console.error('Fetch error:', error);
+                // Check if the error is a TypeError related to URL parsing or network issues
+                if (error instanceof TypeError && error.message.includes("Failed to parse URL")) {
+                    showMessage('Error: Could not connect to the report generation service. Please ensure the backend is running and accessible.', 'error');
+                } else if (error.message === "") { // Handle empty error message
+                    showMessage('An unknown network error occurred. Please check your internet connection and ensure the backend is running.', 'error');
+                }
+                else {
+                    showMessage('An unexpected error occurred. Please try again. Check your browser console for more details.', 'error');
+                }
+            } finally {
+                // Hide loading state and re-enable button
+                buttonText.textContent = 'Generate Report';
+                loadingSpinner.classList.add('hidden');
+                generateReportBtn.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>

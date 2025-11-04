@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Diagnosis WebSocket Client</title>
+  <style>
+    body { font-family: Arial; margin: 20px; }
+    .chat-box { border: 1px solid #ccc; padding: 10px; max-width: 600px; }
+    .bot { color: green; margin: 10px 0; }
+    .user { color: blue; margin: 13px 0; }
+  </style>
+</head >
+<body>
+
+<h2>Diagnosis Chat Test</h2>
+
+<label for="sessionId">Enter Session ID:</label>
+<input type="text" id="sessionId" placeholder="e.g., abc123" />
+<button onclick="startChat()">Start</button>
+
+<div class="chat-box" id="chatBox"></div>
+
+<div id="inputSection" style="display: none;">
+  <label for="userAnswer">Your Answer:</label>
+  <input type="text" id="userAnswer" placeholder="e.g., A" />
+  <button onclick="sendAnswer()">Send</button>
+</div>
+
+<script>
+let socket;
+
+function startChat() {
+  const sessionId = document.getElementById("sessionId").value;
+  const chatBox = document.getElementById("chatBox");
+  chatBox.innerHTML = "<em>Connecting...</em>";
+
+  socket = new WebSocket(`http://127.0.0.1:8000/followup/${sessionId}`);
+
+  socket.onopen = () => {
+    chatBox.innerHTML += "<div class='bot'>🟢 Connected.</div>";
+    document.getElementById("inputSection").style.display = "block";
+  };
+
+  socket.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    if (data.question) {
+      chatBox.innerHTML += `<div class='bot'><strong>Bot:</strong> ${data.question}</div>`;
+      data.options.forEach(opt => {
+        chatBox.innerHTML += `<div class='bot'>${opt.key}: ${opt.value}</div>`;
+      });
+    } else if (data.message) {
+      chatBox.innerHTML += `<div class='bot'><strong>${data.message}</strong></div>`;
+    } else if (data.error) {
+      chatBox.innerHTML += `<div class='bot'><strong>Error:</strong> ${data.error}</div>`;
+    }
+  };
+
+  socket.onclose = () => {
+    chatBox.innerHTML += "<div class='bot'>🔴 Connection closed.</div>";
+    document.getElementById("inputSection").style.display = "none";
+  };
+
+  socket.onerror = (error) => {
+    chatBox.innerHTML += `<div class='bot'>❌ Error: ${error}</div>`;
+  };
+}
+
+function sendAnswer() {
+  const answer = document.getElementById("userAnswer").value;
+  const chatBox = document.getElementById("chatBox");
+
+  if (socket.readyState === WebSocket.OPEN) {
+    socket.send(answer);
+    chatBox.innerHTML += `<div class='user'><strong>You:</strong> ${answer}</div>`;
+    document.getElementById("userAnswer").value = '';
+  } else {
+    chatBox.innerHTML += "<div class='bot'>⚠️ Not connected.</div>";
+  }
+}
+</script>
+
+</body>
+</html>

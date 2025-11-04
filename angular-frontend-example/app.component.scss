@@ -1,0 +1,239 @@
+// Medical Diagnosis App Styles
+
+.medical-diagnosis-app {
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  color: #333;
+  max-width: 800px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+// Header
+.app-header {
+  margin-bottom: 30px;
+  text-align: center;
+  padding: 20px 0;
+  border-bottom: 1px solid #e0e0e0;
+
+  h1 {
+    color: #2c3e50;
+    font-size: 2.2rem;
+    margin: 0;
+  }
+}
+
+// Common container styling
+.patient-form-container,
+.followup-container,
+.complete-container {
+  background-color: white;
+  padding: 30px;
+  border-radius: 10px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  margin-bottom: 20px;
+
+  h2 {
+    margin-bottom: 20px;
+    color: #3498db;
+    text-align: center;
+  }
+}
+
+// Form Styles
+.form-group {
+  margin-bottom: 20px;
+
+  label {
+    display: block;
+    margin-bottom: 8px;
+    font-weight: 500;
+    color: #2c3e50;
+  }
+
+  input,
+  select,
+  textarea {
+    width: 100%;
+    padding: 12px;
+    border: 1px solid #ddd;
+    border-radius: 5px;
+    font-size: 16px;
+    transition: border-color 0.3s;
+
+    &:focus {
+      border-color: #3498db;
+      outline: none;
+      box-shadow: 0 0 0 2px rgba(52, 152, 219, 0.2);
+    }
+  }
+
+  .error-text {
+    color: #e74c3c;
+    font-size: 14px;
+    margin-top: 5px;
+  }
+}
+
+// Buttons
+.submit-button,
+.download-button,
+.new-diagnosis-button,
+.dismiss-button {
+  padding: 12px 24px;
+  font-size: 16px;
+  border-radius: 5px;
+  cursor: pointer;
+  border: none;
+  transition: background-color 0.3s;
+  font-weight: 500;
+}
+
+.submit-button {
+  background-color: #3498db;
+  color: white;
+  display: block;
+  width: 100%;
+  
+  &:hover {
+    background-color: #2980b9;
+  }
+}
+
+.download-button {
+  background-color: #2ecc71;
+  color: white;
+  margin-right: 10px;
+  
+  &:hover {
+    background-color: #27ae60;
+  }
+}
+
+.new-diagnosis-button {
+  background-color: #3498db;
+  color: white;
+  
+  &:hover {
+    background-color: #2980b9;
+  }
+}
+
+// Follow-up styles
+.question-container {
+  margin-top: 20px;
+}
+
+.question {
+  font-size: 18px;
+  margin-bottom: 20px;
+  line-height: 1.5;
+  color: #2c3e50;
+}
+
+.options-container {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 15px;
+}
+
+.option-button {
+  display: flex;
+  align-items: center;
+  padding: 15px;
+  background-color: #f8f9fa;
+  border: 1px solid #e0e0e0;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: all 0.3s;
+  text-align: left;
+  
+  &:hover {
+    background-color: #ecf0f1;
+    border-color: #bdc3c7;
+  }
+}
+
+.option-key {
+  font-weight: bold;
+  margin-right: 10px;
+  background-color: #3498db;
+  color: white;
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.option-value {
+  font-size: 16px;
+  color: #2c3e50;
+}
+
+// Complete diagnosis styles
+.complete-container {
+  text-align: center;
+  
+  p {
+    margin-bottom: 10px;
+    font-size: 16px;
+  }
+  
+  .actions {
+    margin-top: 20px;
+    display: flex;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+}
+
+// Error container
+.error-container {
+  background-color: #f8d7da;
+  border: 1px solid #f5c6cb;
+  color: #721c24;
+  padding: 15px;
+  border-radius: 5px;
+  margin-bottom: 20px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  
+  .error-message {
+    font-size: 16px;
+  }
+  
+  .dismiss-button {
+    background-color: #dc3545;
+    color: white;
+    padding: 8px 12px;
+    font-size: 14px;
+    
+    &:hover {
+      background-color: #c82333;
+    }
+  }
+}
+
+// Responsive design
+@media screen and (max-width: 768px) {
+  .medical-diagnosis-app {
+    padding: 15px;
+  }
+  
+  .options-container {
+    grid-template-columns: 1fr;
+  }
+  
+  .complete-container .actions {
+    flex-direction: column;
+    align-items: center;
+    
+    button {
+      margin: 5px 0;
+      width: 100%;
+    }
+  }
+} 

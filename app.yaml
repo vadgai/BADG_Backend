@@ -1,0 +1,43 @@
+runtime: python310
+
+# Google Cloud Run / App Engine Configuration
+# This file is optional but provides additional configuration options
+
+instance_class: F1
+
+# Automatic scaling configuration
+automatic_scaling:
+  min_instances: 0
+  max_instances: 10
+  target_cpu_utilization: 0.65
+  target_throughput_utilization: 0.75
+
+# Environment variables
+# Note: For Cloud Run, use --set-env-vars flag or Secret Manager
+# env_variables:
+#   ENVIRONMENT: "production"
+#   LOG_LEVEL: "INFO"
+
+# Handlers for static files and routing
+handlers:
+  - url: /.*
+    script: auto
+    secure: always
+    redirect_http_response_code: 301
+
+# Health check configuration
+liveness_check:
+  path: "/health"
+  check_interval_sec: 30
+  timeout_sec: 4
+  failure_threshold: 2
+  success_threshold: 1
+
+readiness_check:
+  path: "/health"
+  check_interval_sec: 10
+  timeout_sec: 4
+  failure_threshold: 2
+  success_threshold: 1
+  app_start_timeout_sec: 300
+
