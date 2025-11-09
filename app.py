@@ -29,7 +29,7 @@ from diagnosis_report.report import final_report
 
 # Import database and new route modules
 from database.connection import connect_to_mongodb, close_mongodb_connection
-from routes import admin, form, contact, report_analyzer, translate
+from routes import admin, form, contact, report_analyzer, translate, translateProxy
 from routes.admin_analytics import router as admin_analytics_router
 
 # Import new modules (commented out until modules are created)
@@ -96,13 +96,23 @@ session_store: Dict[str, dict] = {}
 async def startup_event():
     """Initialize database connection and other startup tasks"""
     logger.info("🚀 Starting VADG API...")
-    logger.info("Initializing MongoDB connection...")
+    logger.info("PORT: %s", os.getenv("PORT", "8080"))
+    logger.info("Environment: %s", os.getenv("ENVIRONMENT", "development"))
+    
+    # Try MongoDB connection with timeout
+    logger.info("Attempting MongoDB connection...")
     try:
-        await connect_to_mongodb()
+        import asyncio
+        # Set a timeout for MongoDB connection
+        await asyncio.wait_for(connect_to_mongodb(), timeout=5.0)
+        logger.info("✅ MongoDB connected")
+    except asyncio.TimeoutError:
+        logger.warning("MongoDB connection timeout - continuing without database")
     except Exception as e:
         logger.warning(f"MongoDB connection skipped: {e}")
-        logger.info("Continuing without MongoDB (Report Analyzer will still work)")
-    logger.info("✅ Startup complete")
+        logger.info("Continuing without MongoDB (core features will still work)")
+    
+    logger.info("✅ Startup complete - Ready to serve requests")
 
 
 @app.on_event("shutdown")
@@ -124,6 +134,7 @@ app.include_router(form.router)
 app.include_router(contact.router)
 app.include_router(report_analyzer.router)
 app.include_router(translate.router, prefix="/api/translate")
+app.include_router(translateProxy.router, prefix="/internal/translate")
 
 
 #
