@@ -29,7 +29,7 @@ from diagnosis_report.report import final_report
 
 # Import database and new route modules
 from database.connection import connect_to_mongodb, close_mongodb_connection
-from routes import admin, form, contact, report_analyzer, translate, translateProxy
+from routes import admin, form, contact, report_analyzer, translate, translateProxy, localizedReport
 from routes.admin_analytics import router as admin_analytics_router
 
 # Import new modules (commented out until modules are created)
@@ -135,6 +135,7 @@ app.include_router(contact.router)
 app.include_router(report_analyzer.router)
 app.include_router(translate.router, prefix="/api/translate")
 app.include_router(translateProxy.router, prefix="/internal/translate")
+app.include_router(localizedReport.router, prefix="/api/localize-report")
 
 
 #
