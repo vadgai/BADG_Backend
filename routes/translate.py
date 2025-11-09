@@ -34,18 +34,23 @@ except Exception as e:
 # Try to import Gemini as fallback (optional)
 try:
     import google.generativeai as genai
-    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+    # Check for API key in multiple env var names
+    GOOGLE_API_KEY = (
+        os.getenv("GEMINI_API_KEY_1") or 
+        os.getenv("GOOGLE_API_KEY") or 
+        os.getenv("GEMINI_API_KEY")
+    )
     if GOOGLE_API_KEY and len(GOOGLE_API_KEY) > 20:  # Basic validation
         try:
             genai.configure(api_key=GOOGLE_API_KEY)
             GEMINI_AVAILABLE = True
-            logger.info("✅ Gemini API initialized as fallback")
+            logger.info("✅ Gemini API initialized for translation")
         except Exception as e:
             GEMINI_AVAILABLE = False
             logger.warning(f"⚠️  Gemini configuration failed: {e}")
     else:
         GEMINI_AVAILABLE = False
-        logger.warning("⚠️  GOOGLE_API_KEY not set or invalid - Gemini fallback unavailable")
+        logger.warning("⚠️  Gemini API key not set or invalid - translation unavailable")
 except ImportError:
     GEMINI_AVAILABLE = False
     logger.warning("⚠️  Gemini not available")
