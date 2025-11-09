@@ -29,7 +29,9 @@ from diagnosis_report.report import final_report
 
 # Import database and new route modules
 from database.connection import connect_to_mongodb, close_mongodb_connection
-from routes import admin, form, contact, report_analyzer, translate, translateProxy, localizedReport
+from routes import admin, form, contact, report_analyzer, translate
+# NOTE: IndicTrans2 integration disabled - using Google/Gemini instead
+# from routes import translateProxy, localizedReport
 from routes.admin_analytics import router as admin_analytics_router
 
 # Import new modules (commented out until modules are created)
@@ -134,8 +136,10 @@ app.include_router(form.router)
 app.include_router(contact.router)
 app.include_router(report_analyzer.router)
 app.include_router(translate.router, prefix="/api/translate")
-app.include_router(translateProxy.router, prefix="/internal/translate")
-app.include_router(localizedReport.router, prefix="/api/localize-report")
+
+# NOTE: IndicTrans2 routes disabled - using Google/Gemini translation instead
+# app.include_router(translateProxy.router, prefix="/internal/translate")
+# app.include_router(localizedReport.router, prefix="/api/localize-report")
 
 
 #
@@ -778,33 +782,10 @@ async def generate_report(session_id: str, lang: str = "en"):
                     # If parsing fails, use as is
                     pass
             
-            # Localize report if language is not English
-            if lang and lang.lower() != "en":
-                try:
-                    from utils.localized_report import localize_diagnosis_report
-                    
-                    logger.info(f"Localizing report for session {session_id} to language: {lang}")
-                    
-                    # Get the actual report dict (may be nested)
-                    report_dict = report.get("report", report) if isinstance(report, dict) else report
-                    
-                    # Localize the report
-                    localized = await localize_diagnosis_report(report_dict, lang)
-                    
-                    # Replace report with localized version
-                    if isinstance(report, dict) and "report" in report:
-                        report["report"] = localized
-                    else:
-                        report = localized
-                    
-                    logger.info(f"✅ Report localized successfully to {lang}")
-                    
-                except Exception as localization_error:
-                    # Log error but continue with English version (safe fallback)
-                    logger.warning(
-                        f"Failed to localize report to {lang}: {str(localization_error)}. "
-                        f"Returning English version."
-                    )
+            # NOTE: IndicTrans2 translation service integration disabled
+            # Currently using Google/Gemini for all translation (via /api/translate)
+            # The lang parameter is kept for frontend compatibility but not used for backend translation
+            # Frontend handles translation using existing Google/Gemini infrastructure
             
             # Update session with report status
             session["report_generated"] = True
