@@ -716,8 +716,17 @@ async def options_generate_report(session_id: str):  # pylint: disable=unused-ar
     return JSONResponse(content={}, status_code=200)
 
 @app.get("/generate_report/{session_id}")
-async def generate_report(session_id: str):
-    """Generate medical report for a session."""
+async def generate_report(session_id: str, lang: str = "en"):
+    """
+    Generate medical report for a session with optional language localization.
+    
+    Args:
+        session_id: The session ID
+        lang: Target language code (en, hi, ta, te, bn, kn). Default: "en"
+    
+    Returns:
+        Report in requested language (localized if lang != "en")
+    """
     try:
         if session_id not in session_store:
             raise HTTPException(status_code=404, detail="Session not found")
@@ -760,9 +769,47 @@ async def generate_report(session_id: str):
             )
 
         if report:
+            # Parse report if it's a JSON string
+            if isinstance(report, str):
+                try:
+                    import json
+                    report = json.loads(report)
+                except:
+                    # If parsing fails, use as is
+                    pass
+            
+            # Localize report if language is not English
+            if lang and lang.lower() != "en":
+                try:
+                    from utils.localized_report import localize_diagnosis_report
+                    
+                    logger.info(f"Localizing report for session {session_id} to language: {lang}")
+                    
+                    # Get the actual report dict (may be nested)
+                    report_dict = report.get("report", report) if isinstance(report, dict) else report
+                    
+                    # Localize the report
+                    localized = await localize_diagnosis_report(report_dict, lang)
+                    
+                    # Replace report with localized version
+                    if isinstance(report, dict) and "report" in report:
+                        report["report"] = localized
+                    else:
+                        report = localized
+                    
+                    logger.info(f"✅ Report localized successfully to {lang}")
+                    
+                except Exception as localization_error:
+                    # Log error but continue with English version (safe fallback)
+                    logger.warning(
+                        f"Failed to localize report to {lang}: {str(localization_error)}. "
+                        f"Returning English version."
+                    )
+            
             # Update session with report status
             session["report_generated"] = True
             session["report_timestamp"] = datetime.utcnow().isoformat()
+            session["report_language"] = lang
             
             response_data = {
                 "patient_details": {
@@ -772,6 +819,7 @@ async def generate_report(session_id: str):
                 },
                 "report": report,
                 "session_id": session_id,
+                "language": lang,
                 "generated_at": datetime.utcnow().isoformat()
             }
             return JSONResponse(content=response_data, status_code=200)
