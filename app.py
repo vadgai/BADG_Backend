@@ -29,7 +29,7 @@ from diagnosis_report.report import final_report
 
 # Import database and new route modules
 from database.connection import connect_to_mongodb, close_mongodb_connection
-from routes import admin, form, contact, report_analyzer, translate
+from routes import admin, form, contact, report_analyzer, translate, disease_info, analytics
 # NOTE: IndicTrans2 integration disabled - using Google/Gemini instead
 # from routes import translateProxy, localizedReport
 from routes.admin_analytics import router as admin_analytics_router
@@ -60,6 +60,23 @@ if CURRENT_DIR not in sys.path:
 
 # Initialize logging
 logger = logging.getLogger("uvicorn.error")
+
+# Disease info prompt (used by disease info route)
+DISEASE_INFO_PROMPT = """You are a medical expert. Provide comprehensive, accurate information about the disease: {disease_name}
+
+Please provide information in {language} language covering:
+1. What is this disease? (Brief description)
+2. What causes it? (Etiology)
+3. Common symptoms and signs
+4. How is it diagnosed?
+5. Treatment options (medical and lifestyle)
+6. Prevention methods
+7. Home remedies (if applicable)
+8. When to see a doctor (red flags)
+
+Format your response in clear, easy-to-understand language for patients.
+Use bullet points and sections for readability.
+Be accurate but avoid unnecessary medical jargon."""
 
 # Create FastAPI app
 app = FastAPI(
@@ -136,6 +153,8 @@ app.include_router(form.router)
 app.include_router(contact.router)
 app.include_router(report_analyzer.router)
 app.include_router(translate.router, prefix="/api/translate")
+app.include_router(disease_info.router)
+app.include_router(analytics.router)
 
 # NOTE: IndicTrans2 routes disabled - using Google/Gemini translation instead
 # app.include_router(translateProxy.router, prefix="/internal/translate")
@@ -340,6 +359,7 @@ async def submit_symptom(payload: DiagnosisRequest):
             "age": payload.age,
             "gender": payload.gender or "unknown",
             "symptoms": extracted_symptoms,
+            "raw_symptoms": symptoms_text,
             "chat_history": [],
             "question_count": 0,
             "created_at": datetime.utcnow().isoformat(),
@@ -474,6 +494,7 @@ async def followup_handler(websocket: WebSocket, session_id: str):
         age = session.get("age")
         gender = session.get("gender")
         symptoms = session.get("symptoms")
+        raw_symptoms = session.get("raw_symptoms")
         chat_history = session.get("chat_history", [])
         # question_count = session.get("question_count", 0)  # Unused for now
         
@@ -495,11 +516,16 @@ async def followup_handler(websocket: WebSocket, session_id: str):
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(executor, lambda: func(*args, **kwargs))
 
+        # Ensure symptoms are passed to Gemini (fallback to raw text if extraction empty)
+        if (not symptoms) and raw_symptoms:
+            symptoms = raw_symptoms
+
         # Check if questions have already been asked (reconnection scenario)
         existing_question_count = session.get("question_count", 0)
         
         # If max questions already reached, send ready_for_diagnosis immediately
-        if existing_question_count >= 12:
+        # Limit to at most 10 follow-up questions for a concise flow.
+        if existing_question_count >= 10:
             logger.info("Session %s: Max questions (%d) already reached. Sending ready_for_diagnosis.", 
                        session_id, existing_question_count)
             await websocket.send_json({"message": "Maximum questions reached, generating diagnosis", "status": "ready_for_diagnosis"})
@@ -528,7 +554,8 @@ async def followup_handler(websocket: WebSocket, session_id: str):
                     get_followup_for_diagnosis, 
                     age, gender, symptoms, chat_history,
                     1,  # max_retries
-                    weight, height, occupation, location, physical_activity, diet_type
+                    weight, height, occupation, location, physical_activity, diet_type,
+                    raw_symptoms
                 )
                 logger.info("✅ Initial question generated successfully")
             except Exception as e:
@@ -545,6 +572,12 @@ async def followup_handler(websocket: WebSocket, session_id: str):
 
             # Log raw response for debugging
             logger.info("Raw generator response (type=%s) for session %s: %s", type(raw_response).__name__, session_id, repr(raw_response)[:2000])
+
+            # If API failure response, inform client and close
+            if isinstance(raw_response, dict) and raw_response.get("error") == "api_key_failure":
+                await websocket.send_json({"error": raw_response.get("message", "Service temporarily unavailable due to high request volume. Please try again later.")})
+                await websocket.close(code=1011, reason="API key failure")
+                return
 
             # If response is valid dict with "Question"
             if isinstance(raw_response, dict) and "Question" in raw_response:
@@ -598,7 +631,8 @@ async def followup_handler(websocket: WebSocket, session_id: str):
             except json.JSONDecodeError:
                 pass  # Not JSON, treat as regular answer
             
-            client_msg_clean = client_msg.strip().upper()
+            client_msg_raw = client_msg.strip()
+            client_msg_clean = client_msg_raw.upper()
 
             # Map A/B/C/D to option text when possible
             last_response = session.get("last_options", {})
@@ -615,9 +649,9 @@ async def followup_handler(websocket: WebSocket, session_id: str):
             if mapped_answer:
                 user_answer = mapped_answer
             else:
-                # If mapping fails, sanitize and append (or choose to ignore)
-                logger.warning("Unmapped response from client for session %s: %s; appending raw (sanitized).", session_id, client_msg_clean)
-                user_answer = client_msg_clean  # or skip appending entirely if you prefer
+                # If mapping fails, append raw (preserve user wording)
+                logger.warning("Unmapped response from client for session %s: %s; appending raw.", session_id, client_msg_raw)
+                user_answer = client_msg_raw
 
             # Add user answer to chat history
             chat_history.append({"user": user_answer})
@@ -644,7 +678,8 @@ async def followup_handler(websocket: WebSocket, session_id: str):
                     get_followup_for_diagnosis, 
                     age, gender, symptoms, updated_chat_history,
                     1,  # max_retries
-                    weight, height, occupation, location, physical_activity, diet_type
+                    weight, height, occupation, location, physical_activity, diet_type,
+                    raw_symptoms
                 )
             except Exception as e:
                 logger.exception("get_followup_for_diagnosis error mid-conversation for session %s: %s", session_id, e)
@@ -659,10 +694,15 @@ async def followup_handler(websocket: WebSocket, session_id: str):
                 await websocket.send_json({"message": "Diagnosis is ready", "status": "ready_for_diagnosis"})
                 await websocket.close(code=1000, reason="Diagnosis ready")
                 break
+            elif isinstance(next_raw, dict) and next_raw.get("error") == "api_key_failure":
+                await websocket.send_json({"error": next_raw.get("message", "Service temporarily unavailable due to high request volume. Please try again later.")})
+                await websocket.close(code=1011, reason="API key failure")
+                break
             elif isinstance(next_raw, dict) and "Question" in next_raw:
                 # Check question count limit before asking another question
                 current_question_count = session.get("question_count", 0)
-                if current_question_count >= 12:  # Set max to 12 questions
+                # Hard cap at 10 follow-up questions
+                if current_question_count >= 10:
                     logger.info("Session %s: Reached maximum questions (%d), forcing diagnosis", session_id, current_question_count)
                     await websocket.send_json({"message": "Maximum questions reached, generating diagnosis", "status": "ready_for_diagnosis"})
                     await websocket.close(code=1000, reason="Max questions reached")
@@ -772,6 +812,182 @@ async def generate_report(session_id: str, lang: str = "en"):
                 detail="AI processing failed while generating report"
             )
 
+        def _normalize_report_for_frontend(raw_report, session_data, mapping_data):
+            """
+            Ensure report has all required fields for frontend + PDF generation.
+            Adds safe defaults when the AI output is incomplete.
+            """
+            report_obj = raw_report
+            if isinstance(report_obj, str):
+                try:
+                    report_obj = json.loads(report_obj)
+                except Exception:
+                    report_obj = {}
+
+            if not isinstance(report_obj, dict):
+                report_obj = {}
+
+            # Ensure PatientInfo
+            patient_info = report_obj.get("PatientInfo") if isinstance(report_obj.get("PatientInfo"), dict) else {}
+            age_val = session_data.get("age")
+            gender_val = session_data.get("gender")
+            name_val = session_data.get("name")
+            if "Age" not in patient_info or not patient_info.get("Age"):
+                patient_info["Age"] = f"{age_val} Years" if age_val is not None else "N/A"
+            if "Gender" not in patient_info or not patient_info.get("Gender"):
+                patient_info["Gender"] = str(gender_val).title() if gender_val else "Unknown"
+            if "Name" not in patient_info or not patient_info.get("Name"):
+                patient_info["Name"] = name_val or "Unknown"
+            report_obj["PatientInfo"] = patient_info
+
+            # Ensure MainSymptoms
+            if not isinstance(report_obj.get("MainSymptoms"), list) or not report_obj.get("MainSymptoms"):
+                symptoms_list = session_data.get("symptoms") or []
+                if not isinstance(symptoms_list, list):
+                    symptoms_list = [str(symptoms_list)]
+                report_obj["MainSymptoms"] = symptoms_list[:8]
+
+            # Ensure Urgency
+            if not report_obj.get("Urgency"):
+                report_obj["Urgency"] = "Routine"
+
+            # Ensure TopDiseaseMatches
+            def _fallback_top_matches(mapping):
+                fallback = []
+                conditions = []
+                if isinstance(mapping, dict):
+                    conditions = mapping.get("conditions") or []
+                if isinstance(conditions, list) and conditions:
+                    for idx, cond in enumerate(conditions[:2], start=1):
+                        name = cond.get("name") if isinstance(cond, dict) else None
+                        prob = cond.get("probability") if isinstance(cond, dict) else None
+                        fallback.append({
+                            f"Disease{idx}": {
+                                f"Name{idx}": name or "Unknown condition",
+                                f"MatchLevel{idx}": prob or "Moderate",
+                                f"PreHospitalCare{idx}": [
+                                    "Stay hydrated",
+                                    "Monitor symptoms closely",
+                                ],
+                                f"SymptomsToWatch{idx}": [
+                                    "Worsening symptoms",
+                                    "Severe pain or breathing difficulty",
+                                ],
+                                f"SelfCare{idx}": [
+                                    "Rest and avoid strenuous activity",
+                                    "Take prescribed medication only",
+                                ],
+                                f"MedicationSuggestion{idx}": [
+                                    "Consult a doctor before taking medication"
+                                ],
+                            }
+                        })
+                if not fallback:
+                    fallback = [{
+                        "Disease1": {
+                            "Name1": "Undetermined",
+                            "MatchLevel1": "Moderate",
+                            "PreHospitalCare1": ["Rest", "Hydration"],
+                            "SymptomsToWatch1": ["Worsening symptoms"],
+                            "SelfCare1": ["Monitor temperature", "Avoid exertion"],
+                            "MedicationSuggestion1": ["Consult a doctor before medication"]
+                        }
+                    }]
+                return fallback
+
+            def _extract_match_name(entry):
+                if not isinstance(entry, dict) or not entry:
+                    return None
+                key = next(iter(entry.keys()), None)
+                data = entry.get(key) if key else None
+                if isinstance(data, dict):
+                    num = key.replace("Disease", "") if key else ""
+                    return (
+                        data.get(f"Name{num}")
+                        or data.get("Name")
+                        or data.get("name")
+                        or data.get("Disease")
+                        or data.get("disease")
+                    )
+                return entry.get("Name") or entry.get("name") or entry.get("Disease") or entry.get("disease")
+
+            def _build_match_entry(idx, name, match_level):
+                return {
+                    f"Disease{idx}": {
+                        f"Name{idx}": name or "Unknown condition",
+                        f"MatchLevel{idx}": match_level or "Moderate",
+                        f"PreHospitalCare{idx}": [
+                            "Stay hydrated",
+                            "Monitor symptoms closely",
+                        ],
+                        f"SymptomsToWatch{idx}": [
+                            "Worsening symptoms",
+                            "Severe pain or breathing difficulty",
+                        ],
+                        f"SelfCare{idx}": [
+                            "Rest and avoid strenuous activity",
+                            "Take prescribed medication only",
+                        ],
+                        f"MedicationSuggestion{idx}": [
+                            "Consult a doctor before taking medication"
+                        ],
+                    }
+                }
+
+            def _ensure_two_matches(existing, mapping):
+                matches = list(existing) if isinstance(existing, list) else []
+                existing_names = set()
+                for entry in matches:
+                    name = _extract_match_name(entry)
+                    if name:
+                        existing_names.add(str(name).strip().lower())
+
+                conditions = []
+                if isinstance(mapping, dict):
+                    conditions = mapping.get("conditions") or []
+
+                idx = len(matches) + 1
+                for cond in conditions:
+                    if len(matches) >= 2:
+                        break
+                    if not isinstance(cond, dict):
+                        continue
+                    name = cond.get("name")
+                    if not name:
+                        continue
+                    name_key = str(name).strip().lower()
+                    if name_key in existing_names:
+                        continue
+                    match_level = cond.get("probability") or "Moderate"
+                    matches.append(_build_match_entry(idx, name, match_level))
+                    existing_names.add(name_key)
+                    idx += 1
+
+                while len(matches) < 2:
+                    matches.append(_build_match_entry(idx, "Undetermined", "Moderate"))
+                    idx += 1
+
+                return matches
+
+            top_matches = report_obj.get("TopDiseaseMatches")
+            if not isinstance(top_matches, list) or not top_matches:
+                top_matches = _fallback_top_matches(mapping_data)
+            elif len(top_matches) > 2:
+                top_matches = top_matches[:2]
+
+            # Ensure we always return at least the top 2 matches
+            report_obj["TopDiseaseMatches"] = _ensure_two_matches(top_matches, mapping_data)
+
+            # Ensure NextDiagnosticSteps
+            if not isinstance(report_obj.get("NextDiagnosticSteps"), list) or not report_obj.get("NextDiagnosticSteps"):
+                report_obj["NextDiagnosticSteps"] = [
+                    "Your doctor may recommend a few diagnostic tests to understand your condition better.",
+                    "A Complete Blood Count (CBC) can help detect infection or inflammation.",
+                    "Additional tests may be suggested based on your top predicted conditions."
+                ]
+
+            return report_obj
+
         if report:
             # Parse report if it's a JSON string
             if isinstance(report, str):
@@ -781,6 +997,9 @@ async def generate_report(session_id: str, lang: str = "en"):
                 except:
                     # If parsing fails, use as is
                     pass
+
+            # Normalize report structure for frontend/PDF robustness
+            report = _normalize_report_for_frontend(report, session, mapped_diseases)
             
             # NOTE: IndicTrans2 translation service integration disabled
             # Currently using Google/Gemini for all translation (via /api/translate)

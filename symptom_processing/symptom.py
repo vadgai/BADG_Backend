@@ -5,39 +5,27 @@ import json
 import logging
 from dotenv import load_dotenv
 load_dotenv()
-import google.generativeai as genai
+
+# Import centralized Gemini API manager
+from utils.gemini_api_manager import get_gemini_model, MODEL_NAME, generate_content_with_fallback
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Dual API key checking (GOOGLE_API_KEY or GEMINI_API_KEY)
-google_api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-MODEL_NAME = "gemini-2.0-flash"
+# Get model from centralized manager (with 15-key fallback support)
+model_available, model = get_gemini_model()
 
-# Model initialization with error handling
-model_available = False
-model = None
-
-# Log API key status
-if not google_api_key:
-    logger.error("❌ GEMINI API KEY NOT FOUND for symptom.py!")
-    logger.error("   Checked: GOOGLE_API_KEY and GEMINI_API_KEY")
-    logger.error("   Please set in Backend/.env file")
+if model_available:
+    logger.info("="*80)
+    logger.info(f"✅ Gemini model available for symptom processing (via API manager)")
+    logger.info(f"   Model: {MODEL_NAME}")
+    logger.info("="*80)
 else:
-    logger.info("✅ Gemini API key loaded successfully (symptom.py)")
-    logger.info(f"   Key prefix: {google_api_key[:10]}..." if len(google_api_key) > 10 else "   Key too short!")
-
-# Attempt to configure and instantiate model
-if google_api_key:
-    try:
-        genai.configure(api_key=google_api_key)
-        model = genai.GenerativeModel(MODEL_NAME)
-        model_available = True
-        logger.info(f"✅ Successfully connected to model: {MODEL_NAME} (symptom.py)")
-    except Exception as e:
-        logger.error(f"❌ Failed to instantiate model in symptom.py: {e}")
-        logger.error("   Symptom extraction may use fallback behavior")
+    logger.warning("="*80)
+    logger.warning("⚠️ Gemini model not available for symptom processing")
+    logger.warning("   Symptom extraction will use fallback behavior")
+    logger.warning("="*80)
 
 
 def extract_medical_terms(text):
@@ -52,6 +40,16 @@ def extract_medical_terms(text):
         return []
 
 
+def _parse_symptom_array(text: str):
+    if not text:
+        return None
+    try:
+        data = json.loads(text.strip())
+        return data if isinstance(data, list) else None
+    except Exception:
+        return None
+
+
 def clarify_symptoms(text):
     """
     Use LLM to extract symptoms from natural language text.
@@ -61,17 +59,44 @@ def clarify_symptoms(text):
         logger.warning("Model not available for symptom clarification")
         return "[]"
     
-    prompt = f"""You are a medical expert. Extract only medical symptoms from this sentence:
-    "{text}".
-    
-    Return ONLY a valid JSON array of symptoms, nothing else.
-    Example: ["headache", "fever", "cough"]
-    
-    JSON array:"""
+    prompt = f"""You are a medical expert. Extract only medical symptoms from the sentence below.
+Respond WITH A SINGLE JSON ARRAY and nothing else. Example: ["headache", "fever"]
+
+Sentence: "{text}"
+Return only the JSON array (no text, no Markdown, no explanation)."""
+
+    retry_prompt = """Previous response could not be parsed. PLEASE RETURN ONLY a JSON array in this exact format:
+["symptom1","symptom2"]
+Do not include any other text."""
     
     try:
-        response = model.generate_content(prompt)
-        return response.text.strip()
+        success, response_text, error = generate_content_with_fallback(
+            prompt=prompt,
+            max_retries=None,
+            temperature=0.2,
+            max_output_tokens=300,
+        )
+        if not success or not response_text:
+            logger.error(f"Error in clarify_symptoms: {error}")
+            return "[]"
+
+        parsed = _parse_symptom_array(response_text)
+        if parsed is None:
+            success, response_text, error = generate_content_with_fallback(
+                prompt=retry_prompt,
+                max_retries=None,
+                temperature=0.2,
+                max_output_tokens=200,
+            )
+            if not success or not response_text:
+                logger.error(f"Error in clarify_symptoms retry: {error}")
+                return "[]"
+            parsed = _parse_symptom_array(response_text)
+
+        if parsed is None:
+            return "[]"
+
+        return json.dumps(parsed)
     except Exception as e:
         logger.error(f"Error in clarify_symptoms: {e}")
         return "[]"
@@ -124,4 +149,3 @@ def hybrid_symptom_extraction(text):
         return llm_terms
     
     return list(set(sci_terms + llm_terms))  
-

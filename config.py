@@ -5,7 +5,8 @@ Handles environment variables, settings, and configuration validation.
 
 import os
 from typing import List, Optional, Dict, Any
-from pydantic import BaseSettings, Field, validator
+from pydantic_settings import BaseSettings
+from pydantic import Field, field_validator
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -18,31 +19,22 @@ class Settings(BaseSettings):
     # API Configuration
     app_name: str = Field(default="VADG API", description="Application name")
     app_version: str = Field(default="2.0.0", description="Application version")
-    debug: bool = Field(default=False, description="Debug mode")
+    debug: Optional[bool] = Field(default=False, description="Debug mode")
     
     # Server Configuration
     host: str = Field(default="0.0.0.0", description="Server host")
     port: int = Field(default=8000, description="Server port")
     reload: bool = Field(default=False, description="Auto-reload on changes")
     
-    # CORS Configuration
-    allowed_origins: List[str] = Field(
-        default=[
-            "https://vadg.in",
-            "https://www.vadg.in",
-            "http://localhost:3000",
-            "http://127.0.0.1:3000",
-            "http://localhost:5173",
-            "http://127.0.0.1:5173",
-            "http://localhost:5174",
-            "http://127.0.0.1:5174"
-        ],
-        description="Allowed CORS origins"
+    # CORS Configuration (comma-separated string in env, list in code)
+    allowed_origins: str = Field(
+        default="https://vadg.in,https://www.vadg.in,http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174",
+        description="Allowed CORS origins (comma-separated)"
     )
     
     # AI Configuration
     google_api_key: Optional[str] = Field(default=None, description="Google AI API key")
-    ai_model: str = Field(default="gemini-2.0-flash", description="AI model name")
+    ai_model: str = Field(default="gemini-2.5-flash", description="AI model name")
     ai_timeout: int = Field(default=30, description="AI request timeout in seconds")
     
     # Database Configuration (for future use)
@@ -67,21 +59,30 @@ class Settings(BaseSettings):
     # Health Check Configuration
     health_check_interval: int = Field(default=30, description="Health check interval in seconds")
     
-    @validator("allowed_origins", pre=True)
-    def parse_allowed_origins(cls, v):
-        """Parse allowed origins from environment variable or use default."""
-        if isinstance(v, str):
-            return [origin.strip() for origin in v.split(",") if origin.strip()]
-        return v
     
-    @validator("google_api_key")
+    @field_validator("debug", mode="before")
+    @classmethod
+    def parse_debug(cls, v):
+        """Parse debug field - handle string values."""
+        if v is None or v == "":
+            return False
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            # Handle various string representations
+            return v.lower() in ("true", "1", "yes", "on")
+        return bool(v)
+    
+    @field_validator("google_api_key")
+    @classmethod
     def validate_google_api_key(cls, v):
         """Validate Google API key format."""
         if v and not v.startswith("AIza"):
             raise ValueError("Invalid Google API key format")
         return v
     
-    @validator("log_level")
+    @field_validator("log_level")
+    @classmethod
     def validate_log_level(cls, v):
         """Validate log level."""
         valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
@@ -89,28 +90,37 @@ class Settings(BaseSettings):
             raise ValueError(f"Invalid log level. Must be one of: {valid_levels}")
         return v.upper()
     
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = False
+    model_config = {
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "case_sensitive": False,
+        "extra": "ignore"  # Ignore extra fields from .env
+    }
 
 
-# Global settings instance
-settings = Settings()
+# Global settings instance (lazy loaded)
+_settings: Optional[Settings] = None
 
 
 def get_settings() -> Settings:
     """Get application settings."""
-    return settings
+    global _settings
+    if _settings is None:
+        _settings = Settings()
+    return _settings
 
 
 def get_cors_origins() -> List[str]:
-    """Get CORS allowed origins."""
+    """Get CORS allowed origins as list."""
+    settings = get_settings()
+    if isinstance(settings.allowed_origins, str):
+        return [origin.strip() for origin in settings.allowed_origins.split(",") if origin.strip()]
     return settings.allowed_origins
 
 
 def is_development() -> bool:
     """Check if running in development mode."""
+    settings = get_settings()
     return settings.debug or os.getenv("ENVIRONMENT", "development").lower() == "development"
 
 
@@ -121,6 +131,7 @@ def is_production() -> bool:
 
 def get_ai_config() -> Dict[str, Any]:
     """Get AI configuration."""
+    settings = get_settings()
     return {
         "api_key": settings.google_api_key,
         "model": settings.ai_model,
@@ -131,6 +142,7 @@ def get_ai_config() -> Dict[str, Any]:
 
 def get_security_config() -> Dict[str, Any]:
     """Get security configuration."""
+    settings = get_settings()
     return {
         "secret_key": settings.secret_key,
         "token_expire_minutes": settings.access_token_expire_minutes,
@@ -141,6 +153,7 @@ def get_security_config() -> Dict[str, Any]:
 
 def get_session_config() -> Dict[str, Any]:
     """Get session configuration."""
+    settings = get_settings()
     return {
         "timeout": settings.session_timeout,
         "max_sessions": settings.max_sessions
@@ -149,6 +162,7 @@ def get_session_config() -> Dict[str, Any]:
 
 def get_logging_config() -> Dict[str, Any]:
     """Get logging configuration."""
+    settings = get_settings()
     return {
         "level": settings.log_level,
         "format": settings.log_format

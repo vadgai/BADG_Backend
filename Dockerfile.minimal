@@ -1,0 +1,42 @@
+# Minimal Dockerfile for debugging Cloud Run issues
+FROM python:3.11-slim
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1 \
+    PORT=8080
+
+# Only install absolute essentials
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libcairo2-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install only critical dependencies first
+RUN pip install --no-cache-dir fastapi uvicorn python-dotenv
+
+# Copy only essential files
+COPY app.py .
+COPY database ./database
+COPY routes ./routes
+COPY models ./models
+COPY symptom_processing ./symptom_processing
+COPY Followup_Generation ./Followup_Generation
+COPY symptom_mapping ./symptom_mapping
+COPY diagnosis_report ./diagnosis_report
+
+# Install remaining dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt || echo "Some packages failed, continuing..."
+
+# Try to download spacy model, but don't fail if it doesn't work
+RUN python -m spacy download en_core_web_sm || echo "Spacy model download skipped"
+
+EXPOSE 8080
+
+# Simple startup with increased timeout
+CMD exec uvicorn app:app --host 0.0.0.0 --port $PORT --timeout-keep-alive 120 --timeout-graceful-shutdown 120
+
+
+

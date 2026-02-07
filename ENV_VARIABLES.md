@@ -68,7 +68,7 @@ PORT=8080                       # Server port (Cloud Run uses 8080)
 
 ### AI Model Configuration
 ```bash
-AI_MODEL=gemini-2.0-flash-exp   # AI model to use
+AI_MODEL=gemini-2.5-flash       # AI model to use
 AI_TIMEOUT=30                   # Timeout in seconds
 MAX_RETRIES=3                   # Max retry attempts
 ```

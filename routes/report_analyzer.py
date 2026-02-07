@@ -16,7 +16,9 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
-import google.generativeai as genai
+
+# Import centralized Gemini API manager
+from utils.gemini_api_manager import get_gemini_model, MODEL_NAME, extract_json_from_text
 
 load_dotenv()
 
@@ -26,16 +28,19 @@ logger = logging.getLogger(__name__)
 # Initialize router
 router = APIRouter(prefix="/api", tags=["report-analyzer"])
 
-# Get API key
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-MODEL_NAME = "gemini-2.0-flash-exp"  # Flash model supports multimodal
+# Get model from centralized manager (with 15-key fallback support)
+model_available, model = get_gemini_model()
 
-# Configure Gemini
-if GOOGLE_API_KEY:
-    genai.configure(api_key=GOOGLE_API_KEY)
-    logger.info("✅ Gemini API configured for Report Analyzer")
+if model_available:
+    logger.info("="*80)
+    logger.info(f"✅ Gemini model available for Report Analyzer (via API manager)")
+    logger.info(f"   Model: {MODEL_NAME}")
+    logger.info("="*80)
 else:
-    logger.error("❌ No Google API key found for Report Analyzer")
+    logger.warning("="*80)
+    logger.warning("⚠️ Gemini model not available for Report Analyzer")
+    logger.warning("   Report analysis features may be limited")
+    logger.warning("="*80)
 
 # Rate limiting storage (simple in-memory, production should use Redis)
 rate_limit_store: Dict[str, List[float]] = {}
@@ -209,8 +214,10 @@ async def analyze_with_gemini(file_path: str, mime_type: str) -> Dict[str, Any]:
         with open(file_path, 'rb') as f:
             file_data = f.read()
         
-        # Create Gemini model
-        model = genai.GenerativeModel(MODEL_NAME)
+        # Get configured Gemini model
+        model_available, model_instance = get_gemini_model()
+        if not model_available or model_instance is None:
+            raise HTTPException(status_code=503, detail="AI service unavailable. Please try again.")
         
         # Prepare file for Gemini
         file_part = {
@@ -220,24 +227,17 @@ async def analyze_with_gemini(file_path: str, mime_type: str) -> Dict[str, Any]:
         
         # Generate content
         prompt = get_gemini_prompt()
-        response = model.generate_content([prompt, file_part])
+        response = model_instance.generate_content([prompt, file_part])
         
-        logger.info(f"Gemini raw response: {response.text[:500]}...")
+        response_text = response.text.strip() if response and response.text else ""
+        logger.info(f"Gemini raw response: {response_text[:500]}...")
         
         # Parse JSON from response
-        # Remove markdown code blocks if present
-        response_text = response.text.strip()
-        if response_text.startswith("```json"):
-            response_text = response_text[7:]
-        if response_text.startswith("```"):
-            response_text = response_text[3:]
-        if response_text.endswith("```"):
-            response_text = response_text[:-3]
-        
-        response_text = response_text.strip()
-        
-        # Parse JSON
-        result = json.loads(response_text)
+        result = extract_json_from_text(response_text)
+        if not result:
+            logger.error("JSON parsing error: Unable to extract JSON from response")
+            logger.error(f"Raw response: {response_text[:2000]}")
+            raise HTTPException(status_code=500, detail="Failed to parse AI response. Please try again.")
         
         # Check if this is a non-medical document
         if result.get("error") == "not_medical":
@@ -266,14 +266,35 @@ async def analyze_with_gemini(file_path: str, mime_type: str) -> Dict[str, Any]:
         
         return validated_result
         
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON parsing error: {e}")
-        logger.error(f"Raw response: {response.text}")
-        raise HTTPException(status_code=500, detail="Failed to parse AI response. Please try again.")
-    
+    except HTTPException:
+        raise
+
     except Exception as e:
+        # Log full error for debugging
         logger.error(f"Gemini analysis error: {e}")
-        raise HTTPException(status_code=500, detail=f"AI analysis failed: {str(e)}")
+
+        # Normalize error text for inspection without leaking provider internals to client
+        error_text = str(e)
+        error_text_lower = error_text.lower()
+
+        # Handle upstream rate limit / quota errors from Gemini explicitly
+        if (
+            "429" in error_text
+            or "rate limit" in error_text_lower
+            or "exceeded your current quota" in error_text_lower
+            or "resource has been exhausted" in error_text_lower
+        ):
+            # Match documentation: treat as temporary unavailability due to rate limits
+            raise HTTPException(
+                status_code=503,
+                detail="AI service temporarily unavailable due to rate limits. Please wait about a minute and try again."
+            )
+
+        # For all other errors, return a generic AI failure message
+        raise HTTPException(
+            status_code=500,
+            detail="AI analysis failed due to an internal error. Please try again."
+        )
 
 
 @router.post("/analyze-report")
@@ -361,4 +382,3 @@ async def analyze_report(request: Request, file: UploadFile = File(...)):
                 logger.info(f"Temporary file deleted: {temp_file}")
             except Exception as e:
                 logger.warning(f"Failed to delete temp file: {e}")
-

@@ -5,39 +5,32 @@ import logging
 from typing import Any, Dict, Optional
 from dotenv import load_dotenv
 load_dotenv()
-import google.generativeai as genai
+
+# Import centralized Gemini API manager
+from utils.gemini_api_manager import (
+    get_gemini_model,
+    MODEL_NAME,
+    generate_content_with_fallback,
+    extract_json_from_text,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Dual API key checking (GOOGLE_API_KEY or GEMINI_API_KEY)
-google_api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-MODEL_NAME = "gemini-2.0-flash"
+# Get model from centralized manager (with 15-key fallback support)
+model_available, model = get_gemini_model()
 
-# Model initialization with error handling
-model_available = False
-model = None
-
-# Log API key status
-if not google_api_key:
-    logger.error("❌ GEMINI API KEY NOT FOUND for mapping.py!")
-    logger.error("   Checked: GOOGLE_API_KEY and GEMINI_API_KEY")
-    logger.error("   Please set in Backend/.env file")
+if model_available:
+    logger.info("="*80)
+    logger.info(f"✅ Gemini model available for disease mapping (via API manager)")
+    logger.info(f"   Model: {MODEL_NAME}")
+    logger.info("="*80)
 else:
-    logger.info("✅ Gemini API key loaded successfully (mapping.py)")
-    logger.info(f"   Key prefix: {google_api_key[:10]}..." if len(google_api_key) > 10 else "   Key too short!")
-
-# Attempt to configure and instantiate model
-if google_api_key:
-    try:
-        genai.configure(api_key=google_api_key)
-        model = genai.GenerativeModel(MODEL_NAME)
-        model_available = True
-        logger.info(f"✅ Successfully connected to model: {MODEL_NAME} (mapping.py)")
-    except Exception as e:
-        logger.error(f"❌ Failed to instantiate model in mapping.py: {e}")
-        logger.error("   Disease mapping may use fallback behavior")
+    logger.warning("="*80)
+    logger.warning("⚠️ Gemini model not available for disease mapping")
+    logger.warning("   Disease mapping will use fallback behavior")
+    logger.warning("="*80)
 
 # minimal logging toggle
 DEBUG = os.getenv("VADG_DEBUG", "0") == "1"
@@ -79,106 +72,71 @@ def _fallback_disease_mapping(symptoms):
         conditions.append({"name": "General malaise", "probability": "Low", "reasoning": "Non-specific symptoms", "urgency": "Monitor"})
     
     result = {
-        "conditions": conditions[:3],  # Top 3
-        "follow_up_questions": [
-            "How long have you had these symptoms?",
-            "Have you taken any medication?",
-            "Any other symptoms you've noticed?"
-        ]
+        "conditions": conditions[:2]  # Top 2
     }
-    
-    return json.dumps(result)
+
+    return result
+
+
+def _format_chat_history(chat_history) -> str:
+    """
+    Normalize chat history into a readable Q/A transcript for LLM prompts.
+    Accepts list of {bot/user} dicts, a JSON string, or plain string.
+    """
+    if not chat_history:
+        return "No previous questions asked."
+
+    if isinstance(chat_history, str):
+        # Try to parse JSON list if present; otherwise return as-is
+        try:
+            parsed = json.loads(chat_history)
+            chat_history = parsed
+        except Exception:
+            return chat_history.strip() or "No previous questions asked."
+
+    if isinstance(chat_history, list):
+        lines = []
+        q_idx = 0
+        for i, msg in enumerate(chat_history):
+            if not isinstance(msg, dict):
+                continue
+            bot_text = msg.get("bot") or msg.get("Question")
+            if bot_text:
+                q_idx += 1
+                lines.append(f"Q{q_idx}: {str(bot_text).strip()}")
+                # Try to pair with next user response if available
+                if i + 1 < len(chat_history):
+                    next_msg = chat_history[i + 1]
+                    if isinstance(next_msg, dict) and next_msg.get("user"):
+                        lines.append(f"A{q_idx}: {str(next_msg.get('user')).strip()}")
+        return "\n".join(lines) if lines else "No previous questions asked."
+
+    return str(chat_history).strip() or "No previous questions asked."
 
 
 
 def generate_llm_prompt(age, gender, symptoms, chat_history, weight=None, height=None, occupation=None, location=None, physical_activity=None, diet_type=None):
-    formatted_symptoms = ", ".join(symptoms)
-    
-    # Build comprehensive patient profile
-    patient_profile = f"""
-        Patient Details:
-        - Age: {age} years
-        - Gender: {gender}"""
-    
-    # Add physical measurements if available
-    if weight and height:
-        bmi = weight / ((height/100) ** 2)
-        patient_profile += f"""
-        - Weight: {weight} kg
-        - Height: {height} cm
-        - BMI: {bmi:.1f} ({"Underweight" if bmi < 18.5 else "Normal" if bmi < 25 else "Overweight" if bmi < 30 else "Obese"})"""
-    elif weight:
-        patient_profile += f"""
-        - Weight: {weight} kg"""
-    elif height:
-        patient_profile += f"""
-        - Height: {height} cm"""
-    
-    # Add lifestyle factors
-    if occupation:
-        patient_profile += f"""
-        - Occupation: {occupation}"""
-    
-    if physical_activity:
-        patient_profile += f"""
-        - Physical Activity Level: {physical_activity.title()}"""
-    
-    if diet_type:
-        diet_display = {
-            "veg": "Vegetarian",
-            "non_veg": "Non-Vegetarian",
-            "vegan": "Vegan",
-            "mixed": "Mixed"
-        }.get(diet_type, diet_type.title())
-        patient_profile += f"""
-        - Diet Type: {diet_display}"""
-    
-    # Add location if available
-    if location:
-        location_str = []
-        if location.get("city"):
-            location_str.append(location["city"])
-        if location.get("state"):
-            location_str.append(location["state"])
-        if location.get("country"):
-            location_str.append(location["country"])
-        if location_str:
-            patient_profile += f"""
-        - Location: {", ".join(location_str)}"""
+    formatted_symptoms = ", ".join(symptoms) if isinstance(symptoms, list) else str(symptoms)
+    chat_history_text = _format_chat_history(chat_history)
 
-    # Enhanced prompt with structured JSON response
     prompt = f"""
-    You are a medical AI assistant analyzing patient data for early disease prediction and clinical reasoning.
+        You are a highly experienced medical diagnosis doctor.
 
-    Patient Profile:
-    {patient_profile}
-    
-    Reported Symptoms: {formatted_symptoms}
+        Patient:
+        - Age: {age}
+        - Gender: {gender}
 
-    Conversation History:
-    {chat_history}
+        Symptoms: {formatted_symptoms}
 
-    Based on this comprehensive context, identify the top 3 likely medical conditions.
-    For each, provide:
-    - Name
-    - Probability level (High / Moderate / Low)
-    - Brief medical reasoning
-    - Urgency (Emergency / Routine / Monitor)
-    Also, suggest relevant follow-up questions to clarify diagnosis.
+        Chat History:
+        {chat_history_text}
 
-    Consider:
-    - How the patient's BMI, activity level, and diet may influence their condition
-    - Occupation-related health risks (e.g., desk job → sedentary issues, physical labor → musculoskeletal issues)
-    - Location-specific diseases and environmental factors
-    - Age and gender-specific conditions
+        Based on all the above, list the top 3 most likely medical conditions or diseases this patient may have. For each, provide:
+        - Condition name
+        - One-line reasoning (based on symptoms + answers)
+        - Urgency level: (Low / Moderate / High)
 
-    Respond strictly in JSON:
-    {{
-      "conditions": [
-        {{"name": "...", "probability": "...", "reasoning": "...", "urgency": "..."}}
-      ],
-      "follow_up_questions": ["...", "..."]
-    }}
+        Make sure your answer is formatted clearly.
     """
 
     # Log the prompt for verification (debug only)
@@ -186,98 +144,6 @@ def generate_llm_prompt(age, gender, symptoms, chat_history, weight=None, height
     
     return prompt
 
-
-
-def generate_llm_prompt_v2(
-    age,
-    gender,
-    weight,
-    height,
-    occupation,
-    activity,
-    diet,
-    country,
-    state,
-    city,
-    symptoms,
-    chat_history,
-):
-    formatted_symptoms = ", ".join(symptoms)
-
-    # compute BMI if possible
-    bmi_text = ""
-    if weight and height:
-        try:
-            bmi_val = float(weight) / ((float(height) / 100.0) ** 2)
-            bmi_cat = (
-                "Underweight" if bmi_val < 18.5 else
-                "Normal" if bmi_val < 25 else
-                "Overweight" if bmi_val < 30 else
-                "Obese"
-            )
-            bmi_text = f"\n    - BMI: {bmi_val:.1f} ({bmi_cat})"
-        except Exception:
-            bmi_text = ""
-
-    prompt = f"""
-    You are an expert clinical diagnostician performing differential diagnosis analysis. Your task is to synthesize ALL available patient data into a coherent clinical picture and rank the most likely conditions.
-
-    Patient Profile:
-    - Age: {age} years (consider age-related disease susceptibility, physiological changes, and epidemiology)
-    - Gender: {gender} (consider gender-specific conditions and hormonal factors)
-    - Weight: {weight} kg | Height: {height} cm{bmi_text}
-    - Occupation: {occupation} (assess occupational hazards, stress, sedentary vs physical work)
-    - Physical Activity: {activity} (evaluate cardiovascular fitness, metabolic health)
-    - Diet: {diet} (consider nutritional deficiencies, metabolic disorders)
-    - Geographic Location: {city}, {state}, {country}
-      → Regional disease patterns, endemic infections, climate factors, pollution levels, healthcare access
-
-    Reported Symptoms: {formatted_symptoms}
-
-    Detailed Clinical History (Q&A Responses):
-    {chat_history}
-
-    CLINICAL REASONING APPROACH:
-    1. **Pattern Recognition**: Analyze symptom constellation - which symptoms cluster together in known disease patterns?
-    2. **Temporal Analysis**: Consider onset (acute vs gradual), duration, progression, timing patterns
-    3. **Severity Assessment**: Evaluate symptom intensity and functional impact
-    4. **Risk Stratification**: Factor in age, gender, BMI, lifestyle, occupation, and geographic risk factors
-    5. **Differential Diagnosis**: Distinguish between competing diagnoses using discriminating clinical features
-    6. **Likelihood Ranking**: Assign probability based on symptom match, prevalence, and patient-specific risk factors
-
-    PROBABILITY ASSIGNMENT RULES:
-    - **High**: ≥70% symptom match + strong supporting evidence from history + consistent with patient demographics
-    - **Moderate**: 50-70% symptom match + some supporting evidence + plausible for patient profile
-    - **Low**: <50% symptom match OR missing key features BUT still possible differential
-
-    URGENCY CLASSIFICATION:
-    - **Emergency**: Life-threatening symptoms, severe organ dysfunction, requires immediate medical attention
-    - **Routine**: Stable symptoms, schedule appointment within 24-48 hours
-    - **Monitor**: Mild symptoms, self-limiting conditions, observe and seek care if worsening
-
-    TASK: Identify the TOP 3 most likely medical conditions based on comprehensive analysis of ALL available data.
-
-    For each condition provide:
-    1. **Name**: Specific disease/condition (use medical terminology but clear)
-    2. **Probability**: High / Moderate / Low (based on clinical reasoning above)
-    3. **Reasoning**: 2-3 sentences explaining WHY this diagnosis fits (cite specific symptoms, risk factors, clinical features)
-    4. **Urgency**: Emergency / Routine / Monitor
-
-    Also suggest 2-3 relevant follow-up questions that would help confirm or rule out the top diagnoses.
-
-    RESPOND STRICTLY IN JSON FORMAT (no markdown, no extra text):
-    {{
-      "conditions": [
-        {{"name": "...", "probability": "High/Moderate/Low", "reasoning": "Clinical reasoning with specific symptom references", "urgency": "Emergency/Routine/Monitor"}},
-        {{"name": "...", "probability": "...", "reasoning": "...", "urgency": "..."}},
-        {{"name": "...", "probability": "...", "reasoning": "...", "urgency": "..."}}
-      ],
-      "follow_up_questions": ["...", "...", "..."]
-    }}
-    """
-
-    _maybe_log("LLM PROMPT (v2) =>", prompt)
-    return prompt
 
 
 def get_disease_symptom_mapping(
@@ -292,25 +158,18 @@ def get_disease_symptom_mapping(
     physical_activity=None,
     diet_type=None,
 ):
-    # Derive country/state/city safely from location dict
-    country = (location or {}).get("country") if isinstance(location, dict) else None
-    state = (location or {}).get("state") if isinstance(location, dict) else None
-    city = (location or {}).get("city") if isinstance(location, dict) else None
-
-    # Build prompt using v2 (explicit geo + age reasoning)
-    prompt = generate_llm_prompt_v2(
+    # Build prompt using stable v1 formatter
+    prompt = generate_llm_prompt(
         age,
         gender,
+        symptoms,
+        chat_history,
         weight,
         height,
         occupation,
-        (physical_activity.title() if isinstance(physical_activity, str) else physical_activity),
+        location,
+        physical_activity,
         diet_type,
-        country,
-        state,
-        city,
-        symptoms,
-        chat_history,
     )
 
     # Check if model is available
@@ -325,21 +184,34 @@ def get_disease_symptom_mapping(
         _maybe_log("LLM RESPONSE (cache) =>", json.dumps(cached) if isinstance(cached, (dict, list)) else str(cached))
         return cached
 
-    # Synchronous model call (callers already use thread executors)
+    # Use centralized multi-key manager with robust JSON extraction
     try:
-        response = model.generate_content(prompt)
-        text = getattr(response, "text", "") or ""
+        success, text, error = generate_content_with_fallback(
+            prompt=prompt,
+            max_retries=None,  # try all available keys
+            temperature=0.3,
+            max_output_tokens=1500,
+        )
+        if not success or not text:
+            logger.error("Disease mapping generation failed: %s", error)
+            return _fallback_disease_mapping(symptoms)
     except Exception as e:
         logger.error(f"Error generating disease mapping: {e}")
         return _fallback_disease_mapping(symptoms)
 
     _maybe_log("LLM RESPONSE =>", text)
 
-    # Try to parse JSON response; fallback to raw text
+    # Try to parse JSON response; fallback to deterministic mapping
+    parsed = extract_json_from_text(text)
+    if isinstance(parsed, dict):
+        _prompt_cache[key] = parsed
+        return parsed
+
+    # Secondary parse attempt
     try:
         parsed = json.loads(text)
         _prompt_cache[key] = parsed
         return parsed
     except Exception:
-        _prompt_cache[key] = text
-        return text
+        _prompt_cache[key] = _fallback_disease_mapping(symptoms)
+        return _prompt_cache[key]
