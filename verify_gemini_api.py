@@ -138,11 +138,11 @@ Generate ONLY the JSON, nothing else."""
     
     # Test 5: Verify model name consistency
     print("[Test 5] Verifying model name consistency...")
-    if MODEL_NAME == "gemini-2.5-flash":
+    if MODEL_NAME == "gemini-3.1-flash-lite-preview":
         print(f"[PASS] Using correct model: {MODEL_NAME}")
     else:
         print(f"[FAIL] Model name incorrect!")
-        print(f"       Expected: gemini-2.5-flash")
+        print(f"       Expected: gemini-3.1-flash-lite-preview")
         print(f"       Got: {MODEL_NAME}")
         return 1
     
@@ -157,7 +157,7 @@ Generate ONLY the JSON, nothing else."""
     print(f"[INFO] API Keys loaded: {key_info['total_keys']}")
     print(f"[INFO] Currently using key: #{key_info['current_index']}")
     print()
-    print("[SUCCESS] Gemini API is working correctly with gemini-2.5-flash!")
+    print("[SUCCESS] Gemini API is working correctly with gemini-3.1-flash-lite-preview!")
     print("="*80)
     
     return 0

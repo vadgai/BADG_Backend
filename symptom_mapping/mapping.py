@@ -1,8 +1,9 @@
 import os
 import json
+import math
 import hashlib
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -48,6 +49,78 @@ def _maybe_log(title: str, content: str):
         print(content)
         print("=" * 80)
 
+
+def _coerce_numeric(value: Optional[Union[int, float, str]]) -> Optional[float]:
+    """Safely coerce numeric inputs; return None for invalid/unclear values."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in {"", "na", "n/a", "none", "null", "unknown", "-"}:
+            return None
+        cleaned = "".join(ch for ch in raw if ch in "0123456789.+-")
+        if cleaned in {"", ".", "+", "-", "+.", "-."}:
+            return None
+        try:
+            parsed = float(cleaned)
+        except Exception:
+            return None
+    else:
+        try:
+            parsed = float(value)
+        except Exception:
+            return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _normalize_height_cm(height_value: Optional[Union[int, float, str]]) -> Optional[float]:
+    """Normalize height to centimeters from cm/meters/inches."""
+    value = _coerce_numeric(height_value)
+    if value is None or value <= 0:
+        return None
+
+    if 0.5 <= value <= 2.5:
+        value = value * 100.0
+    elif 36 <= value <= 96:
+        value = value * 2.54
+
+    if not (90 <= value <= 250):
+        return None
+    return value
+
+
+def _build_bmi_signal(weight: Optional[Union[int, float, str]], height: Optional[Union[int, float, str]]) -> Dict[str, Optional[Union[bool, float, str]]]:
+    """Compute BMI signal for disease ranking prompts without breaking on bad input."""
+    weight_kg = _coerce_numeric(weight)
+    height_cm = _normalize_height_cm(height)
+    if weight_kg is None or height_cm is None or weight_kg <= 0 or not (20 <= weight_kg <= 400):
+        return {"available": False, "value": None, "category": "Unknown", "text": "Not available"}
+
+    bmi = weight_kg / ((height_cm / 100.0) ** 2)
+    if not math.isfinite(bmi) or bmi <= 0 or bmi > 80:
+        return {"available": False, "value": None, "category": "Unknown", "text": "Not available"}
+
+    if bmi < 18.5:
+        category = "Underweight"
+    elif bmi < 25:
+        category = "Normal"
+    elif bmi < 30:
+        category = "Overweight"
+    else:
+        category = "Obese"
+
+    bmi_rounded = round(bmi, 1)
+    return {
+        "available": True,
+        "value": bmi_rounded,
+        "category": category,
+        "text": f"{bmi_rounded:.1f} ({category})",
+    }
+
 def _fallback_disease_mapping(symptoms):
     """
     Fallback disease mapping when AI is unavailable.
@@ -55,89 +128,197 @@ def _fallback_disease_mapping(symptoms):
     """
     symptom_str = ", ".join(symptoms) if isinstance(symptoms, list) else str(symptoms)
     symptom_lower = symptom_str.lower()
-    
-    # Basic symptom-to-disease mapping
+
     conditions = []
-    
+
     if any(s in symptom_lower for s in ["fever", "temperature", "hot"]):
-        conditions.append({"name": "Viral infection", "probability": "Moderate", "reasoning": "Fever is a common symptom", "urgency": "Monitor"})
-    
+        conditions.append(
+            {
+                "name": "Viral infection",
+                "probability": "Moderate",
+                "match_score": "6/10",
+                "reasoning": "Fever fits a viral syndrome pattern.",
+                "urgency": "Self-Care",
+            }
+        )
+
     if any(s in symptom_lower for s in ["cough", "phlegm", "chest"]):
-        conditions.append({"name": "Respiratory infection", "probability": "Moderate", "reasoning": "Respiratory symptoms present", "urgency": "Monitor"})
-    
+        conditions.append(
+            {
+                "name": "Respiratory infection",
+                "probability": "Moderate",
+                "match_score": "6/10",
+                "reasoning": "Respiratory symptoms are reported.",
+                "urgency": "Self-Care",
+            }
+        )
+
     if any(s in symptom_lower for s in ["headache", "head pain"]):
-        conditions.append({"name": "Tension headache", "probability": "Moderate", "reasoning": "Headache reported", "urgency": "Routine"})
-    
+        conditions.append(
+            {
+                "name": "Tension headache",
+                "probability": "Low",
+                "match_score": "4/10",
+                "reasoning": "Headache reported without clear red flags.",
+                "urgency": "Self-Care",
+            }
+        )
+
     if not conditions:
-        conditions.append({"name": "General malaise", "probability": "Low", "reasoning": "Non-specific symptoms", "urgency": "Monitor"})
-    
-    result = {
-        "conditions": conditions[:2]  # Top 2
+        conditions.append(
+            {
+                "name": "General malaise",
+                "probability": "Low",
+                "match_score": "3/10",
+                "reasoning": "Non-specific symptoms reported.",
+                "urgency": "Self-Care",
+            }
+        )
+
+    diagnosis_summary = "Symptoms suggest a non-specific acute illness based on limited information."
+    return {
+        "diagnosis_summary": diagnosis_summary,
+        "conditions": conditions[:3],
+        "suggested_specialist": "General Physician",
     }
 
+
+def _normalize_mapping_result(data: Dict, symptoms) -> Dict:
+    """Ensure disease mapping output has a stable 1-3 condition shape."""
+    if not isinstance(data, dict):
+        return _fallback_disease_mapping(symptoms)
+
+    raw_conditions = data.get("conditions")
+    if not isinstance(raw_conditions, list):
+        return _fallback_disease_mapping(symptoms)
+
+    normalized = []
+    for cond in raw_conditions:
+        if not isinstance(cond, dict):
+            continue
+        name = str(cond.get("name", "")).strip()
+        probability = str(cond.get("probability", "Low")).strip()
+        match_score = str(cond.get("match_score", "")).strip()
+        reasoning = str(cond.get("reasoning", "")).strip()
+        urgency = str(cond.get("urgency", "Routine")).strip()
+        if not name:
+            continue
+        if not probability:
+            probability = "Low"
+        allowed_urgency = {"Emergency", "Urgent", "Routine", "Self-Care", "Monitor", "High", "Moderate", "Low"}
+        if urgency not in allowed_urgency:
+            urgency = "Routine"
+        if not reasoning:
+            reasoning = "Based on reported symptoms and follow-up responses."
+        entry = {
+            "name": name,
+            "probability": probability,
+            "reasoning": reasoning,
+            "urgency": urgency,
+        }
+        if match_score:
+            entry["match_score"] = match_score
+        normalized.append(entry)
+        if len(normalized) >= 3:
+            break
+
+    if not normalized:
+        return _fallback_disease_mapping(symptoms)
+
+    result = {"conditions": normalized}
+    if "diagnosis_summary" in data:
+        result["diagnosis_summary"] = str(data.get("diagnosis_summary", "")).strip()
+    if "accuracy_warning" in data:
+        result["accuracy_warning"] = str(data.get("accuracy_warning", "")).strip()
+    if "suggested_specialist" in data:
+        result["suggested_specialist"] = str(data.get("suggested_specialist", "")).strip()
     return result
 
 
-def _format_chat_history(chat_history) -> str:
-    """
-    Normalize chat history into a readable Q/A transcript for LLM prompts.
-    Accepts list of {bot/user} dicts, a JSON string, or plain string.
-    """
-    if not chat_history:
-        return "No previous questions asked."
 
-    if isinstance(chat_history, str):
-        # Try to parse JSON list if present; otherwise return as-is
-        try:
-            parsed = json.loads(chat_history)
-            chat_history = parsed
-        except Exception:
-            return chat_history.strip() or "No previous questions asked."
+def generate_llm_prompt(
+    age,
+    gender,
+    symptoms,
+    symptom_state=None,
+    negatives=None,
+    weight=None,
+    height=None,
+    occupation=None,
+    location=None,
+    physical_activity=None,
+    diet_type=None,
+):
+    state = symptom_state if isinstance(symptom_state, dict) else {}
+    positives = state.get("current_symptoms") if isinstance(state.get("current_symptoms"), list) else symptoms
+    positives = positives if isinstance(positives, list) else [str(positives)] if positives else []
+    positives = [str(s).strip() for s in positives if str(s).strip()]
+    formatted_symptoms = ", ".join(positives) if positives else "None reported"
 
-    if isinstance(chat_history, list):
-        lines = []
-        q_idx = 0
-        for i, msg in enumerate(chat_history):
-            if not isinstance(msg, dict):
-                continue
-            bot_text = msg.get("bot") or msg.get("Question")
-            if bot_text:
-                q_idx += 1
-                lines.append(f"Q{q_idx}: {str(bot_text).strip()}")
-                # Try to pair with next user response if available
-                if i + 1 < len(chat_history):
-                    next_msg = chat_history[i + 1]
-                    if isinstance(next_msg, dict) and next_msg.get("user"):
-                        lines.append(f"A{q_idx}: {str(next_msg.get('user')).strip()}")
-        return "\n".join(lines) if lines else "No previous questions asked."
+    modifiers = state.get("modifiers") if isinstance(state.get("modifiers"), list) else []
+    red_flags = state.get("red_flags") if isinstance(state.get("red_flags"), list) else []
+    questions_asked = state.get("questions_asked") if isinstance(state.get("questions_asked"), list) else []
 
-    return str(chat_history).strip() or "No previous questions asked."
+    negatives_list = negatives if isinstance(negatives, list) else []
+    negatives_list = [str(n).strip() for n in negatives_list if str(n).strip()]
+    symptoms_negatives = ", ".join(negatives_list) if negatives_list else "None reported"
 
+    bmi_signal = _build_bmi_signal(weight, height)
+    bmi_value = f"{bmi_signal['value']:.1f}" if bmi_signal.get("available") and bmi_signal.get("value") is not None else "Not available"
+    bmi_category = bmi_signal.get("category", "Unknown") if bmi_signal.get("available") else "Unknown"
+    modifiers_text = ", ".join(str(m).strip() for m in modifiers if str(m).strip()) or "None reported"
+    red_flags_text = ", ".join(str(r).strip() for r in red_flags if str(r).strip()) or "None reported"
+    asked_count = len(questions_asked)
 
+    prompt = f"""ACT: Medical Reporter (Mapping Mode).
+GOAL: Produce TOP 3 disease matches from structured clinical evidence only.
 
-def generate_llm_prompt(age, gender, symptoms, chat_history, weight=None, height=None, occupation=None, location=None, physical_activity=None, diet_type=None):
-    formatted_symptoms = ", ".join(symptoms) if isinstance(symptoms, list) else str(symptoms)
-    chat_history_text = _format_chat_history(chat_history)
+=== EVIDENCE BOARD ===
+Profile: {age}/{gender}, BMI: {bmi_value} ({bmi_category})
+Positive Findings (+): {formatted_symptoms}
+Negative Findings (-): {symptoms_negatives}
+Modifiers: {modifiers_text}
+Red Flags: {red_flags_text}
+Questions Asked: {asked_count}
 
-    prompt = f"""
-        You are a highly experienced medical diagnosis doctor.
+=== DIAGNOSTIC ALGORITHM ===
+1. Use ONLY structured findings above (no raw chat history inference).
+2. Rank top 3 conditions by best fit to (+), (-), modifiers, and demographics.
+3. If "Weight Loss" is positive, prioritize chronic/systemic causes over acute self-limiting infections.
+4. If red flags are present, elevate urgency accordingly.
+5. Keep reasoning concise and explicitly evidence-grounded to (+)/(-)/modifiers/red flags.
+6. Never output placeholders like "Condition 1" in final values.
 
-        Patient:
-        - Age: {age}
-        - Gender: {gender}
-
-        Symptoms: {formatted_symptoms}
-
-        Chat History:
-        {chat_history_text}
-
-        Based on all the above, list the top 3 most likely medical conditions or diseases this patient may have. For each, provide:
-        - Condition name
-        - One-line reasoning (based on symptoms + answers)
-        - Urgency level: (Low / Moderate / High)
-
-        Make sure your answer is formatted clearly.
-    """
+=== OUTPUT JSON ONLY ===
+{{
+  "diagnosis_summary": "Short evidence-based summary.",
+  "conditions": [
+    {{
+      "name": "Appendicitis",
+      "probability": "High|Moderate|Low",
+      "match_score": "0-10",
+      "reasoning": "Why this fits (+) and (-).",
+      "urgency": "Emergency|Routine|Monitor|Self-Care"
+    }},
+    {{
+      "name": "Gastroenteritis",
+      "probability": "High|Moderate|Low",
+      "match_score": "0-10",
+      "reasoning": "Why this is second.",
+      "urgency": "Emergency|Routine|Monitor|Self-Care"
+    }},
+    {{
+      "name": "Acid Peptic Disease",
+      "probability": "High|Moderate|Low",
+      "match_score": "0-10",
+      "reasoning": "Why this remains possible.",
+      "urgency": "Emergency|Routine|Monitor|Self-Care"
+    }}
+  ],
+  "accuracy_warning": "Optional confidence note.",
+  "suggested_specialist": "Optional specialist"
+}}
+"""
 
     # Log the prompt for verification (debug only)
     _maybe_log("LLM PROMPT =>", prompt)
@@ -157,19 +338,29 @@ def get_disease_symptom_mapping(
     location=None,
     physical_activity=None,
     diet_type=None,
+    symptom_state=None,
+    patient_state=None,
+    negatives=None,
 ):
+    state_obj = symptom_state if isinstance(symptom_state, dict) else {}
+    patient_state_obj = patient_state if isinstance(patient_state, dict) else {}
+    negatives_list = negatives if isinstance(negatives, list) else patient_state_obj.get("negatives", [])
+    if not isinstance(negatives_list, list):
+        negatives_list = []
+
     # Build prompt using stable v1 formatter
     prompt = generate_llm_prompt(
         age,
         gender,
         symptoms,
-        chat_history,
-        weight,
-        height,
-        occupation,
-        location,
-        physical_activity,
-        diet_type,
+        symptom_state=state_obj,
+        negatives=negatives_list,
+        weight=weight,
+        height=height,
+        occupation=occupation,
+        location=location,
+        physical_activity=physical_activity,
+        diet_type=diet_type,
     )
 
     # Check if model is available
@@ -190,7 +381,7 @@ def get_disease_symptom_mapping(
             prompt=prompt,
             max_retries=None,  # try all available keys
             temperature=0.3,
-            max_output_tokens=1500,
+            max_output_tokens=900,
         )
         if not success or not text:
             logger.error("Disease mapping generation failed: %s", error)
@@ -204,14 +395,16 @@ def get_disease_symptom_mapping(
     # Try to parse JSON response; fallback to deterministic mapping
     parsed = extract_json_from_text(text)
     if isinstance(parsed, dict):
-        _prompt_cache[key] = parsed
-        return parsed
+        normalized = _normalize_mapping_result(parsed, symptoms)
+        _prompt_cache[key] = normalized
+        return normalized
 
     # Secondary parse attempt
     try:
         parsed = json.loads(text)
-        _prompt_cache[key] = parsed
-        return parsed
+        normalized = _normalize_mapping_result(parsed, symptoms)
+        _prompt_cache[key] = normalized
+        return normalized
     except Exception:
         _prompt_cache[key] = _fallback_disease_mapping(symptoms)
         return _prompt_cache[key]

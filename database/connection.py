@@ -32,8 +32,10 @@ logger = logging.getLogger(__name__)
 
 # MongoDB configuration
 # IMPORTANT: Set MONGO_URI in environment variables for production
-MONGO_URI = os.getenv("MONGO_URI")
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "vadg")
+# Supports MONGO_URI or legacy MONGODB_URL from env.example
+_raw_mongo_uri = os.getenv("MONGO_URI") or os.getenv("MONGODB_URL")
+MONGO_URI = _raw_mongo_uri.strip() if _raw_mongo_uri else None
+MONGO_DB_NAME = (os.getenv("MONGO_DB_NAME") or os.getenv("MONGODB_DATABASE") or "vadg").strip()
 MONGO_MAX_POOL_SIZE = int(os.getenv("MONGO_MAX_POOL_SIZE", "50"))
 MONGO_MIN_POOL_SIZE = int(os.getenv("MONGO_MIN_POOL_SIZE", "10"))
 
@@ -182,6 +184,14 @@ async def create_indexes():
         await _database.contact_submissions.create_index("email")
         await _database.contact_submissions.create_index("timestamp")
         await _database.contact_submissions.create_index([("timestamp", -1)])  # Descending for recent first
+
+        # report_analyzer_submissions indexes
+        await _database.report_analyzer_submissions.create_index("timestamp")
+        await _database.report_analyzer_submissions.create_index("patient_name")
+        await _database.report_analyzer_submissions.create_index([("timestamp", -1)])
+        await _database.report_analyzer_submissions.create_index(
+            "timestamp", expireAfterSeconds=2592000
+        )
         
         logger.info("✅ Database indexes created successfully")
         
@@ -236,4 +246,10 @@ def get_partial_reports_collection():
     """Get partial reports collection"""
     db = get_database()
     return db.partial_reports if db is not None else None
+
+
+def get_report_analyzer_submissions_collection():
+    """Get report analyzer submissions collection"""
+    db = get_database()
+    return db.report_analyzer_submissions if db is not None else None
 

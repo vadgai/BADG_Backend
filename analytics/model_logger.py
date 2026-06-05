@@ -104,7 +104,7 @@ def log_model_call(
     Context manager to automatically log model calls with latency tracking.
     
     Usage:
-        with log_model_call("gemini-2.5-flash", session_id="abc123") as log:
+        with log_model_call("gemini-3.1-flash-lite-preview", session_id="abc123") as log:
             response = model.generate_content(prompt)
             log.set_response(response, prompt_length=len(prompt))
     """

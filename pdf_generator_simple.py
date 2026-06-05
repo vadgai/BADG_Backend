@@ -200,13 +200,22 @@ def generate_hindi_pdf_simple(report_data, language='hi'):
             c.showPage()
             y = PAGE_HEIGHT - MARGIN_TOP
         
-        disease_key = list(disease_obj.keys())[0]
-        disease = disease_obj[disease_key]
-        num = disease_key.replace('Disease', '')
+        # Support both flat format {"Name": ..., "MatchLevel": ...}
+        # and old nested format {"Disease1": {"Name1": ..., "MatchLevel1": ...}}
+        if isinstance(disease_obj, dict) and "Name" in disease_obj:
+            disease = disease_obj
+            num_suffix = ""
+        else:
+            disease_key = list(disease_obj.keys())[0] if disease_obj else ""
+            disease = disease_obj.get(disease_key, {})
+            num_suffix = disease_key.replace('Disease', '') if disease_key else str(idx + 1)
+        
+        def _get(field):
+            return disease.get(field) or disease.get(f"{field}{num_suffix}")
         
         # Disease name
-        disease_name = disease.get(f'Name{num}', 'N/A')
-        match_level = disease.get(f'MatchLevel{num}', 'N/A')
+        disease_name = _get('Name') or 'N/A'
+        match_level = _get('MatchLevel') or 'N/A'
         
         if language == 'hi':
             match_map = {'High': 'उच्च मिलान', 'Moderate': 'मध्यम मिलान', 'Low': 'कम मिलान'}
@@ -226,7 +235,7 @@ def generate_hindi_pdf_simple(report_data, language='hi'):
         c.drawString(MARGIN_LEFT + 5, y, normalize_text(label))
         y -= 12
         
-        care_items = disease.get(f'PreHospitalCare{num}', []) + disease.get(f'SelfCare{num}', [])
+        care_items = (_get('PreHospitalCare') or []) + (_get('SelfCare') or [])
         for care in care_items:
             y = draw_bullet_text(c, MARGIN_LEFT + 10, y, str(care), font_name, 9)
             if y < 100:
@@ -236,7 +245,7 @@ def generate_hindi_pdf_simple(report_data, language='hi'):
         y -= 5
         
         # Red Flags
-        red_flags = disease.get(f'SymptomsToWatch{num}', [])
+        red_flags = _get('SymptomsToWatch') or []
         if red_flags:
             c.setFont(font_name, 10)
             c.setFillColor(colors.black)
@@ -253,7 +262,7 @@ def generate_hindi_pdf_simple(report_data, language='hi'):
             y -= 5
         
         # Medications
-        medications = disease.get(f'MedicationSuggestion{num}', [])
+        medications = _get('MedicationSuggestion') or []
         if medications:
             c.setFont(font_name, 10)
             c.setFillColor(colors.black)

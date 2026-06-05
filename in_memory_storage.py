@@ -9,6 +9,8 @@ from datetime import datetime
 in_memory_visits: List[Dict[str, Any]] = []
 in_memory_reports: List[Dict[str, Any]] = []
 in_memory_contacts: List[Dict[str, Any]] = []
+in_memory_report_analyzer_submissions: List[Dict[str, Any]] = []
+in_memory_career_applications: List[Dict[str, Any]] = []
 
 
 async def store_visit_in_memory(visit_data: Dict[str, Any]):
@@ -27,6 +29,41 @@ async def store_contact_in_memory(contact_data: Dict[str, Any]):
     """Store contact data in memory"""
     contact_data["timestamp"] = datetime.utcnow()
     in_memory_contacts.append(contact_data)
+
+
+async def store_report_analyzer_submission_in_memory(submission_data: Dict[str, Any]):
+    """Store report analyzer submission in memory"""
+    import uuid
+    submission_data.setdefault("_id", str(uuid.uuid4()))
+    submission_data["timestamp"] = datetime.utcnow()
+    in_memory_report_analyzer_submissions.insert(0, submission_data)
+
+
+async def store_career_application_in_memory(application_data: Dict[str, Any]):
+    """Store career application metadata in memory (resume not stored in memory blob)."""
+    application_data["timestamp"] = datetime.utcnow()
+    in_memory_career_applications.insert(0, application_data)
+
+
+def get_report_analyzer_submissions_from_memory(skip: int = 0, limit: int = 20) -> Dict[str, Any]:
+    """Get report analyzer submissions from memory"""
+    total = len(in_memory_report_analyzer_submissions)
+    return {
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "submissions": in_memory_report_analyzer_submissions[skip : skip + limit],
+    }
+
+
+def delete_report_analyzer_submission_from_memory(submission_id: str) -> bool:
+    """Delete a report analyzer submission from memory by _id"""
+    global in_memory_report_analyzer_submissions
+    before = len(in_memory_report_analyzer_submissions)
+    in_memory_report_analyzer_submissions = [
+        item for item in in_memory_report_analyzer_submissions if item.get("_id") != submission_id
+    ]
+    return len(in_memory_report_analyzer_submissions) < before
 
 
 def get_visits_from_memory(page: int = 1, limit: int = 50) -> Dict[str, Any]:

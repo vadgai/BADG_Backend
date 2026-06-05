@@ -161,3 +161,23 @@ async def session_heartbeat(request: Request):
             "message": "Heartbeat update failed (non-fatal)."
         }
 
+
+# Ad-blockers often block URLs containing "analytics". Mirror routes under /api/telemetry.
+telemetry_router = APIRouter(prefix="/api/telemetry", tags=["telemetry"])
+telemetry_router.add_api_route(
+    "/event",
+    track_event,
+    methods=["POST"],
+    response_model=EventResponse,
+)
+telemetry_router.add_api_route(
+    "/session/{session_id}",
+    get_session_info,
+    methods=["GET"],
+)
+telemetry_router.add_api_route(
+    "/session/heartbeat",
+    session_heartbeat,
+    methods=["POST"],
+)
+

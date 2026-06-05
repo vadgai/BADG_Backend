@@ -2,7 +2,7 @@
 
 **Date:** January 26, 2026  
 **Status:** ✅ **FULLY OPERATIONAL**  
-**Model:** `gemini-2.5-flash`
+**Model:** `gemini-3.1-flash-lite-preview`
 
 ---
 
@@ -15,7 +15,7 @@ The VADG (Virtual AI Doctor for General Health) system is **fully operational** 
 ## ✅ System Components Status
 
 ### 1. Gemini API Integration (✅ OPERATIONAL)
-- **Model:** `gemini-2.5-flash`
+- **Model:** `gemini-3.1-flash-lite-preview`
 - **Status:** Active and verified
 - **API Keys:** 15 keys loaded (Key #1 active, Keys #2-#15 standby)
 - **Fallback:** Automatic rotation on rate limits (0.1s delay)
@@ -32,33 +32,33 @@ The VADG (Virtual AI Doctor for General Health) system is **fully operational** 
 
 #### ✅ Follow-Up Question Generator
 - **File:** `Backend/Followup_Generation/followup.py`
-- **Model:** gemini-2.5-flash (via API manager)
+- **Model:** gemini-3.1-flash-lite-preview (via API manager)
 - **Status:** Working correctly
 
 #### ✅ Follow-Up Question Generator v2
 - **File:** `Backend/Followup_Generation/followup_v2.py`
-- **Model:** gemini-2.5-flash (via API manager)
+- **Model:** gemini-3.1-flash-lite-preview (via API manager)
 - **Features:** Enhanced with guaranteed output + fallback
 - **Status:** Working correctly
 
 #### ✅ Diagnosis Report Generator
 - **File:** `Backend/diagnosis_report/report.py`
-- **Model:** gemini-2.5-flash (via API manager)
+- **Model:** gemini-3.1-flash-lite-preview (via API manager)
 - **Status:** Working correctly
 
 #### ✅ Symptom Processor
 - **File:** `Backend/symptom_processing/symptom.py`
-- **Model:** gemini-2.5-flash (via API manager)
+- **Model:** gemini-3.1-flash-lite-preview (via API manager)
 - **Status:** **UPDATED** - Now using centralized API manager
 
 #### ✅ Disease Mapping
 - **File:** `Backend/symptom_mapping/mapping.py`
-- **Model:** gemini-2.5-flash (via API manager)
+- **Model:** gemini-3.1-flash-lite-preview (via API manager)
 - **Status:** **UPDATED** - Now using centralized API manager
 
 #### ✅ Report Analyzer
 - **File:** `Backend/routes/report_analyzer.py`
-- **Model:** gemini-2.5-flash (via API manager)
+- **Model:** gemini-3.1-flash-lite-preview (via API manager)
 - **Status:** **UPDATED** - Now using centralized API manager
 
 ### 4. WebSocket (✅ OPERATIONAL)

@@ -9,6 +9,8 @@ import json
 import logging
 from typing import Dict, List, Optional, Tuple, Any
 
+from diagnosis_report.report import build_next_diagnostic_steps
+
 logger = logging.getLogger(__name__)
 
 
@@ -107,13 +109,13 @@ def validate_report_structure(report: Dict[str, Any]) -> Tuple[bool, List[str], 
     # ========== NEXTDIAGNOSTICSTEPS VALIDATION ==========
     if "NextDiagnosticSteps" in validated_report:
         if not isinstance(validated_report["NextDiagnosticSteps"], list):
-            validated_report["NextDiagnosticSteps"] = ["Further diagnostic tests may be required based on clinical assessment."]
-            warnings.append("NextDiagnosticSteps must be a list, converted to default")
+            validated_report["NextDiagnosticSteps"] = []
+            warnings.append("NextDiagnosticSteps must be a list, rebuilding from report context")
         else:
-            # Ensure all steps are strings
-            validated_report["NextDiagnosticSteps"] = [str(s) for s in validated_report["NextDiagnosticSteps"] if s]
-            if len(validated_report["NextDiagnosticSteps"]) == 0:
-                validated_report["NextDiagnosticSteps"] = ["Further diagnostic tests may be required based on clinical assessment."]
+            validated_report["NextDiagnosticSteps"] = [
+                str(s) for s in validated_report["NextDiagnosticSteps"] if s
+            ]
+    validated_report["NextDiagnosticSteps"] = build_next_diagnostic_steps(validated_report)
     
     # ========== TOPDISEASEMATCHES VALIDATION ==========
     if "TopDiseaseMatches" in validated_report:

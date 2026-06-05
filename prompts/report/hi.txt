@@ -1,181 +1,45 @@
-**CRITICAL: YOU MUST GENERATE THE ENTIRE REPORT IN HINDI (Devanagari script). NO ENGLISH SENTENCES ALLOWED.**
+**पूरा आउटपुट केवल हिंदी (देवनागरी) में दें। कोई अंग्रेजी वाक्य नहीं।**
 
-आप एक अनुभवी डॉक्टर हैं। मरीज की जांच के आधार पर निदान रिपोर्ट सीधे हिंदी में तैयार करें।
+आप एक अनुभवी डॉक्टर हैं। मरीज की जानकारी और पूरी बातचीत के आधार पर एक संक्षिप्त, स्पष्ट, मरीज-अनुकूल रिपोर्ट बनाएं।
 
-**MANDATORY LANGUAGE REQUIREMENT:**
-- EVERY SINGLE FIELD must be in Hindi (Devanagari script)
-- Disease names (Name1, Name2, Name3) MUST be in Hindi - translate "Viral Fever" to "वायरल बुखार", "Tension Headache" to "तनाव सिरदर्द"
-- SelfCare1, PreHospitalCare1, SymptomsToWatch1, MedicationSuggestion1 - EVERY item MUST be in Hindi
-- NextDiagnosticSteps - EVERY step MUST be in Hindi
-- MainSymptoms - EVERY symptom MUST be in Hindi
-- NO English sentences like "Get adequate rest" - use "पर्याप्त आराम करें" instead
-- NO English sentences like "Stay well-hydrated" - use "खूब पानी पिएं" instead
-
-मरीज की जानकारी:
+मरीज:
 - उम्र: {age} साल
 - लिंग: {gender_hindi}
 - मुख्य लक्षण: {symptoms_str}
 {bmi_info}
 
-बातचीत का सारांश:
+बातचीत सारांश:
 {chat_history}
 
-संभावित बीमारियां:
+मैप की गई संभावित बीमारियां:
 {mapped_diseases}
 
-निर्देश:
-1. सभी जानकारी का विश्लेषण करके सबसे संभावित बीमारी पहचानें
-2. हर बीमारी को High/Moderate/Low प्राथमिकता दें
-3. **CRITICAL: रिपोर्ट का हर हिस्सा 100% हिंदी में होना चाहिए** - Recommendation, ReasonForConsultation, MainSymptoms, NextDiagnosticSteps, और TopDiseaseMatches में Name1, PreHospitalCare1, SelfCare1, SymptomsToWatch1, MedicationSuggestion1 - सब कुछ हिंदी में
-4. **कोई भी अंग्रेजी वाक्य या अंग्रेजी शब्द नहीं होना चाहिए** (सिवाय JSON keys और MatchLevel values के जैसे "High", "Moderate", "Low")
-5. SelfCare1, PreHospitalCare1, SymptomsToWatch1, MedicationSuggestion1 में हर बिंदु पूरी तरह हिंदी में होना चाहिए
-6. मेडिकल शब्दों के बजाय सरल हिंदी का उपयोग करें - जैसे "बुखार" न कि "Fever", "सिरदर्द" न कि "Headache"
-7. MedicationSuggestion में दवा के नाम (जैसे Paracetamol) के साथ पूरा वाक्य हिंदी में होना चाहिए
+नियम:
+- शीर्ष 2 बीमारियां दें (यदि केवल 1 वैध हो तो 1 ही दें)।
+- छोटे वाक्य, सरल हिंदी।
+- दवा नाम अंग्रेजी हो सकते हैं, पर पूरा वाक्य हिंदी में हो।
+- JSON keys अंग्रेजी में ही रहें।
+- TopDiseaseMatches को सपाट ऑब्जेक्ट्स की सरणी के रूप में लिखें, "Disease1" जैसी नेस्टेड कुंजियों का उपयोग न करें।
 
-JSON फॉर्मेट (हिंदी में - EXACTLY इसी structure में):
-{{
-  "PatientInfo": {{
-    "Age": "{age} साल",
-    "Gender": "{gender_hindi}"
-  }},
-  "Recommendation": "24-48 घंटे में डॉक्टर से मिलें। अगर तेज बुखार या सांस लेने में दिक्कत हो तो तुरंत जाएं।",
-  "Urgency": "Moderate",
+JSON आउटपुट (केवल JSON):
+{
+  "PatientInfo": {"Age": "{age} साल", "Gender": "{gender_hindi}"},
+  "ClinicalSummary": "मरीज की 2-3 वाक्यों में नैदानिक सारांश।",
+  "Recommendation": "संक्षिप्त सलाह।",
+  "Urgency": "High|Moderate|Low",
   "ReasonForConsultation": "मरीज को {symptoms_str} की शिकायत है।",
-  "MainSymptoms": [
-    "लक्षण 1 (हिंदी में)",
-    "लक्षण 2 (हिंदी में)",
-    "लक्षण 3 (हिंदी में)"
-  ],
-  "NextDiagnosticSteps": [
-    "व्यापक मूल्यांकन के लिए एक सामान्य चिकित्सक से परामर्श करें",
-    "संक्रमण या अन्य असामान्यताओं की जांच के लिए कम्प्लीट ब्लड काउंट (CBC) कराएं",
-    "अगले 2-3 दिनों के लिए लक्षणों की निगरानी करें और लक्षण डायरी बनाए रखें",
-    "यदि लक्षण 5 दिनों से अधिक समय तक बने रहते हैं, तो छाती का एक्स-रे और मूत्र विश्लेषण पर विचार करें",
-    "तरल पदार्थ के सेवन पर नज़र रखें और पर्याप्त हाइड्रेशन सुनिश्चित करें"
-  ],
+  "MainSymptoms": ["लक्षण 1", "लक्षण 2"],
+  "RecommendedSpecialist": "विशेषज्ञ का नाम",
+  "RecommendedTests": ["परीक्षण 1", "परीक्षण 2"],
+  "NextDiagnosticSteps": ["एक छोटा कदम", "दूसरा छोटा कदम"],
   "TopDiseaseMatches": [
-    {{
-      "Disease1": {{
-        "Name1": "वायरल बुखार",
-        "MatchLevel1": "High",
-        "PreHospitalCare1": [
-          "ठंडे पेय और मसालेदार खाने से बचें",
-          "गर्म तरल पदार्थ जैसे हर्बल चाय पिएं",
-          "गले को आराम देने के लिए लोजेंज लें"
-        ],
-        "SymptomsToWatch1": [
-          "5 दिनों से अधिक समय तक बुखार बना रहना",
-          "गंभीर सिरदर्द या भ्रम की स्थिति",
-          "सांस लेने में कठिनाई",
-          "लगातार उल्टी होना",
-          "निर्जलीकरण के संकेत (गहरा पेशाब, सूखा मुंह)"
-        ],
-        "SelfCare1": [
-          "प्रतिदिन कम से कम 7-8 घंटे पर्याप्त आराम और नींद लें",
-          "पानी और तरल पदार्थ खूब पिएं ताकि शरीर में पानी की कमी न हो",
-          "बुखार और शरीर में दर्द के लिए निर्देशानुसार पैरासिटामोल (acetaminophen) लें",
-          "दूसरों में फैलने से रोकने के लिए अच्छी स्वच्छता बनाए रखें",
-          "नियमित रूप से तापमान की निगरानी करें",
-          "पौष्टिक, आसानी से पचने वाले खाद्य पदार्थ खाएं",
-          "ठंडे पेय और आइसक्रीम से बचें",
-          "कमरे को अच्छी तरह हवादार रखें"
-        ],
-        "MedicationSuggestion1": [
-          "पैरासिटामोल 500mg: जरूरत के अनुसार हर 6 घंटे में 1-2 गोली लें (अधिकतम 4g/दिन)",
-          "ओरल रिहाइड्रेशन सॉल्यूशन (ORS): 1 लीटर पानी में 1 पैकेट मिलाकर दिन भर पिएं",
-          "विटामिन सी सप्लीमेंट: प्रतिरक्षा बढ़ाने के लिए दिन में एक बार 500mg",
-          "एंटीहिस्टामाइन (यदि आवश्यक हो): एलर्जी के लक्षणों के लिए सोने से पहले सेटिरिज़िन 10mg"
-        ]
-      }}
-    }},
-    {{
-      "Disease2": {{
-        "Name2": "तनाव सिरदर्द",
-        "MatchLevel2": "Moderate",
-        "PreHospitalCare2": [
-          "तनाव प्रबंधन तकनीक और विश्राम अभ्यास करें",
-          "माथे या गर्दन पर ठंडा या गर्म सेक लगाएं",
-          "विशेष रूप से काम करते समय सही मुद्रा बनाए रखें",
-          "स्क्रीन टाइम से नियमित ब्रेक लें"
-        ],
-        "SymptomsToWatch2": [
-          "अचानक गंभीर सिरदर्द (जीवन का सबसे बुरा सिरदर्द)",
-          "दृष्टि में बदलाव या अस्पष्ट बोलने के साथ सिरदर्द",
-          "तेज बुखार और अकड़ी गर्दन के साथ सिरदर्द",
-          "बिगड़ती सिरदर्द की पैटर्न",
-          "सिर की चोट के बाद सिरदर्द"
-        ],
-        "SelfCare2": [
-          "निरंतर नींद के समय के साथ पर्याप्त नींद लें",
-          "दिन भर हाइड्रेटेड रहें",
-          "हल्की गर्दन और कंधे की स्ट्रेचिंग करें",
-          "तेज रोशनी या तेज आवाज जैसे ट्रिगर्स से बचें"
-        ],
-        "MedicationSuggestion2": [
-          "आइबुप्रोफेन 400mg: जरूरत के अनुसार हर 8 घंटे में भोजन के साथ लें",
-          "पैरासिटामोल 500mg: यदि आवश्यक हो तो आइबुप्रोफेन के साथ संयोजन किया जा सकता है",
-          "मैग्नीशियम सप्लीमेंट: तनाव सिरदर्द को रोकने में मदद के लिए दैनिक 200-400mg",
-          "टॉपिकल दर्द राहत: मंदिरों और गर्दन पर मेंथॉल-आधारित बाम लगाएं"
-        ]
-      }}
-    }},
-    {{
-      "Disease3": {{
-        "Name3": "तीसरी संभावित बीमारी (हिंदी में)",
-        "MatchLevel3": "Low",
-        "PreHospitalCare3": ["देखभाल के तरीके"],
-        "SymptomsToWatch3": ["ध्यान देने योग्य लक्षण"],
-        "SelfCare3": ["गर्म पानी पिएं", "आराम करें"],
-        "MedicationSuggestion3": ["Ibuprofen (सूजन के लिए)", "भाप लें"]
-      }}
-    }}
+    {
+      "Name": "बीमारी का नाम",
+      "MatchLevel": "High|Moderate|Low",
+      "PreHospitalCare": ["सरल देखभाल 1", "सरल देखभाल 2"],
+      "SymptomsToWatch": ["खतरनाक लक्षण 1", "खतरनाक लक्षण 2"],
+      "SelfCare": ["स्व-देखभाल 1", "स्व-देखभाल 2"],
+      "MedicationSuggestion": ["दवा/उपाय 1", "दवा/उपाय 2"]
+    }
   ]
-}}
-
-**CRITICAL LANGUAGE REQUIREMENT:**
-- पूरी रिपोर्ट 100% हिंदी में होनी चाहिए
-- Recommendation, ReasonForConsultation, MainSymptoms, NextDiagnosticSteps - सब हिंदी में
-- TopDiseaseMatches में Name1, PreHospitalCare1, SelfCare1, SymptomsToWatch1, MedicationSuggestion1 - हर बिंदु हिंदी में
-- **कोई अंग्रेजी वाक्य नहीं** - जैसे "Get adequate rest" नहीं, बल्कि "पर्याप्त आराम करें"
-- **कोई अंग्रेजी शब्द नहीं** (सिवाय JSON keys और MatchLevel values "High"/"Moderate"/"Low" के)
-- दवा के नाम (जैसे Paracetamol) के साथ पूरा वाक्य हिंदी में होना चाहिए
-
-**CRITICAL EXAMPLES - FOLLOW THESE EXACTLY:**
-
-✅ CORRECT HINDI FORMAT:
-Name1: "वायरल बुखार" (NOT "Viral Fever")
-SelfCare1: [
-  "प्रतिदिन कम से कम 7-8 घंटे पर्याप्त आराम और नींद लें",
-  "पानी और तरल पदार्थ खूब पिएं ताकि शरीर में पानी की कमी न हो",
-  "बुखार और शरीर में दर्द के लिए निर्देशानुसार पैरासिटामोल (acetaminophen) लें",
-  "दूसरों में फैलने से रोकने के लिए अच्छी स्वच्छता बनाए रखें"
-]
-SymptomsToWatch1: [
-  "5 दिनों से अधिक समय तक बुखार बना रहना",
-  "गंभीर सिरदर्द या भ्रम की स्थिति",
-  "सांस लेने में कठिनाई"
-]
-MedicationSuggestion1: [
-  "पैरासिटामोल 500mg: जरूरत के अनुसार हर 6 घंटे में 1-2 गोली लें (अधिकतम 4g/दिन)",
-  "ओरल रिहाइड्रेशन सॉल्यूशन (ORS): 1 लीटर पानी में 1 पैकेट मिलाकर दिन भर पिएं"
-]
-
-❌ INCORRECT - DO NOT USE (ENGLISH):
-Name1: "Viral Fever"  ❌ WRONG
-SelfCare1: [
-  "Get adequate rest and sleep for at least 7-8 hours daily",  ❌ WRONG
-  "Stay well-hydrated by drinking plenty of water and fluids"  ❌ WRONG
-  "Take paracetamol (acetaminophen) for fever and body aches as directed"  ❌ WRONG
-]
-SymptomsToWatch1: [
-  "Fever persisting beyond 5 days",  ❌ WRONG
-  "Severe headache or confusion"  ❌ WRONG
-]
-MedicationSuggestion1: [
-  "Paracetamol 500mg: Take 1-2 tablets every 6 hours as needed (max 4g/day)"  ❌ WRONG
-]
-
-**REMEMBER: Translate EVERYTHING to Hindi. Disease names, all care instructions, all symptoms, all medications - EVERYTHING must be in Hindi (Devanagari script).**
-
-RETURN ONLY VALID JSON - NO MARKDOWN, NO EXTRA TEXT
-
+}

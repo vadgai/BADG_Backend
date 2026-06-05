@@ -13,7 +13,11 @@ import re
 from typing import Dict, List, Optional, Any
 from fastapi import WebSocket, WebSocketDisconnect
 
-from Followup_Generation.followup import get_followup_for_diagnosis, get_followup_for_diagnosis_hindi, _convert_to_new_format, _validate_mcq_structure, _normalize_mcq_keys
+from Followup_Generation.followup import (
+    get_followup_for_diagnosis,
+    _validate_mcq_structure,
+    _normalize_mcq_keys,
+)
 from diagnosis_methods.patient_state import (
     initialize_patient_state,
     update_patient_state,
@@ -26,6 +30,104 @@ from diagnosis_methods.state_followup import (
 from diagnosis_methods.entropy_tracker import EntropyTracker
 
 logger = logging.getLogger(__name__)
+
+
+def get_followup_for_diagnosis_hindi(*args, **kwargs):
+    """
+    Backward-compatible wrapper.
+    The dedicated Hindi helper was removed from Followup_Generation.followup.
+    """
+    return get_followup_for_diagnosis(*args, **kwargs)
+
+
+def _convert_to_new_format(
+    raw_response: Dict,
+    language: str = "en",
+    next_question_number: int = 1,
+) -> Dict[str, Any]:
+    """
+    Normalize follow-up output into frontend-friendly format:
+    {"question": str, "options": [str, ...]}.
+    """
+    hi_defaults = ["Haan", "Nahin", "Pakka nahin", "Inme se koi nahin"]
+    en_defaults = ["Yes", "No", "Not sure", "None of these"]
+    fallback_question = (
+        "Kya aap apne lakshanon ke baare me thoda aur bata sakte hain?"
+        if language == "hi"
+        else "Can you share more details about your symptoms?"
+    )
+
+    if not isinstance(raw_response, dict):
+        defaults = hi_defaults if language == "hi" else en_defaults
+        return {
+            "question": fallback_question,
+            "options": defaults,
+            "question_number": next_question_number,
+            "language": language,
+        }
+
+    parsed = _normalize_mcq_keys(raw_response)
+
+    # Accept alternate structured payload format if present.
+    if "follow_up_questions" in parsed and not _validate_mcq_structure(parsed):
+        questions = parsed.get("follow_up_questions")
+        if isinstance(questions, list) and questions and isinstance(questions[0], dict):
+            first = questions[0]
+            options_dict = first.get("options") or {}
+            parsed = {
+                "Question": first.get("question", ""),
+                "A": options_dict.get("A", ""),
+                "B": options_dict.get("B", ""),
+                "C": options_dict.get("C", ""),
+                "D": options_dict.get("D", ""),
+            }
+
+    question = str(parsed.get("Question") or parsed.get("question") or "").strip()
+    options: List[str] = []
+
+    raw_options = parsed.get("options")
+    if isinstance(raw_options, list):
+        options = [str(opt).strip() for opt in raw_options if str(opt).strip()]
+    elif isinstance(raw_options, dict):
+        for key in ("A", "B", "C", "D", "E"):
+            value = raw_options.get(key) or raw_options.get(key.lower())
+            if value:
+                options.append(str(value).strip())
+
+    if not options:
+        for key in ("A", "B", "C", "D", "E"):
+            value = parsed.get(key) or parsed.get(key.lower())
+            if value:
+                options.append(str(value).strip())
+
+    # Remove duplicates while preserving order.
+    deduped: List[str] = []
+    seen = set()
+    for opt in options:
+        key = opt.lower()
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(opt)
+    options = deduped[:5]
+
+    if not question:
+        question = fallback_question
+
+    defaults = hi_defaults if language == "hi" else en_defaults
+    if len(options) < 2:
+        for default_opt in defaults:
+            if default_opt.lower() not in seen:
+                options.append(default_opt)
+                seen.add(default_opt.lower())
+            if len(options) >= 4:
+                break
+
+    return {
+        "question": question,
+        "options": options,
+        "question_number": next_question_number,
+        "language": language,
+    }
 
 
 def _validate_question_response(response: Dict) -> bool:
@@ -810,4 +912,3 @@ async def run_diagnosis_method_2(
             await websocket.send_json({"error": "Unexpected response format"})
             await websocket.close(code=1011, reason="Unexpected format")
             break
-

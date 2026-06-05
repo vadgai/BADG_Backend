@@ -10,14 +10,548 @@ This module implements "Sequential Differential Diagnosis" using pure LLM reason
 
 import json
 import logging
-from typing import Optional, Union, Dict, List
+import os
+import re
+from typing import Any, Optional, Union, Dict, List
 from dotenv import load_dotenv
 load_dotenv()
 
 from utils.gemini_api_manager import generate_content_with_fallback, extract_json_from_text
 from diagnosis_methods.patient_state import state_to_prompt_string
+from diagnosis_rule_engine import analyze_case, load_diseases_from_folder, build_disease_profiles, DISEASE_PROFILES
 
 logger = logging.getLogger(__name__)
+_DIAG_V6_QUESTION_PLANNER = str(os.getenv("DIAG_V6_QUESTION_PLANNER", "true")).strip().lower() in {"1", "true", "yes", "on"}
+_PROFILES_READY = False
+
+_PLACEHOLDER_MARKERS = {
+    "clinically precise question",
+    "specific clinical",
+    "specific clinical question",
+    "specific finding",
+    "specific option",
+    "disease 1",
+    "disease 2",
+    "option a",
+    "option b",
+    "option c",
+}
+
+_GENERIC_QUESTION_MARKERS = {
+    "getting worse",
+    "can you share more details",
+    "any other symptoms",
+    "new or worsening symptoms",
+    "symptom progression",
+    "breathing difficulties",
+    "clinically precise differentiator question",
+    "clinically precise question",
+    "specific clinical",
+    "specific finding",
+}
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip().lower())
+
+
+def _token_set(text: str) -> set:
+    return {t for t in re.findall(r"[a-z0-9]+", _normalize_text(text)) if t}
+
+
+def _jaccard(a: str, b: str) -> float:
+    sa = _token_set(a)
+    sb = _token_set(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / float(len(sa | sb))
+
+
+def _extract_asked_questions(patient_state: Dict) -> List[str]:
+    """Extract all previously asked questions from both symptom_state and raw chat_history."""
+    seen: set = set()
+    cleaned: List[str] = []
+
+    # Primary source: symptom_state.questions_asked
+    symptom_state = patient_state.get("symptom_state") if isinstance(patient_state.get("symptom_state"), dict) else {}
+    for q in (symptom_state.get("questions_asked") or []):
+        q_text = str(q).strip()
+        norm = _normalize_text(q_text)
+        if q_text and norm not in seen:
+            seen.add(norm)
+            cleaned.append(q_text)
+
+    # Secondary source: raw chat_history [{"bot": ..., "user": ...}, ...]
+    for msg in (patient_state.get("chat_history") or []):
+        if not isinstance(msg, dict):
+            continue
+        q_text = str(msg.get("bot") or "").strip()
+        norm = _normalize_text(q_text)
+        if q_text and norm not in seen:
+            seen.add(norm)
+            cleaned.append(q_text)
+
+    return cleaned
+
+
+def _format_chat_history(patient_state: Dict) -> str:
+    """Format full Q&A pairs from chat_history for LLM context."""
+    history: List[Dict] = patient_state.get("chat_history") or []
+    if not history:
+        return "No previous questions asked."
+
+    lines: List[str] = []
+    turn = 0
+    i = 0
+    while i < len(history):
+        msg = history[i]
+        if not isinstance(msg, dict):
+            i += 1
+            continue
+        bot_q = str(msg.get("bot") or "").strip()
+        user_a = str(msg.get("user") or "").strip()
+        if bot_q:
+            turn += 1
+            lines.append(f"Q{turn}: {bot_q}")
+            if user_a:
+                lines.append(f"A{turn}: {user_a}")
+            elif i + 1 < len(history) and isinstance(history[i + 1], dict):
+                next_user = str(history[i + 1].get("user") or "").strip()
+                if next_user:
+                    lines.append(f"A{turn}: {next_user}")
+                    i += 1
+        elif user_a and lines:
+            lines.append(f"(Answer): {user_a}")
+        i += 1
+
+    return "\n".join(lines) if lines else "No previous questions asked."
+
+
+def _contains_placeholder_text(text: str) -> bool:
+    t = _normalize_text(text)
+    if not t:
+        return True
+    return any(marker in t for marker in _PLACEHOLDER_MARKERS)
+
+
+def _is_generic_question(text: str) -> bool:
+    t = _normalize_text(text)
+    if not t:
+        return True
+    return any(marker in t for marker in _GENERIC_QUESTION_MARKERS)
+
+
+def _is_repeated_question(question: str, asked_questions: List[str]) -> bool:
+    q = _normalize_text(question)
+    if not q:
+        return True
+    for asked in asked_questions:
+        a = _normalize_text(asked)
+        if not a:
+            continue
+        if q == a:
+            return True
+        if _jaccard(q, a) >= 0.78:
+            return True
+    return False
+
+
+def _extract_top_two_condition_names(patient_state: Dict) -> List[str]:
+    differential = patient_state.get("differential_diagnosis")
+    names: List[str] = []
+    if isinstance(differential, list):
+        for item in differential:
+            if isinstance(item, dict):
+                name = str(item.get("name", "")).strip()
+                if name:
+                    names.append(name)
+            if len(names) >= 2:
+                break
+    return names
+
+
+def _ensure_profiles_loaded() -> None:
+    global _PROFILES_READY
+    if _PROFILES_READY and DISEASE_PROFILES:
+        return
+    load_diseases_from_folder()
+    build_disease_profiles()
+    _PROFILES_READY = True
+
+
+def _extract_profile_by_name(condition_name: str) -> Optional[Dict]:
+    target = _normalize_text(condition_name)
+    if not target:
+        return None
+    for profile in DISEASE_PROFILES:
+        name = _normalize_text(profile.get("name", ""))
+        if not name:
+            continue
+        if name == target or name in target or target in name:
+            return profile
+    return None
+
+
+def _known_findings_set(patient_state: Dict) -> set:
+    positives = patient_state.get("identified_symptoms") if isinstance(patient_state.get("identified_symptoms"), list) else []
+    negatives = patient_state.get("negatives") if isinstance(patient_state.get("negatives"), list) else []
+    known = set()
+    for item in positives + negatives:
+        term = _normalize_text(item)
+        if term:
+            known.add(term)
+    return known
+
+
+def _feature_terms(profile: Dict, bucket: str) -> List[Dict[str, Union[str, float]]]:
+    terms: List[Dict[str, Union[str, float]]] = []
+    features = profile.get("features", {}).get(bucket, []) if isinstance(profile.get("features"), dict) else []
+    if isinstance(features, list) and features:
+        for feature in features:
+            if isinstance(feature, dict):
+                term = _normalize_text(feature.get("term"))
+                if not term:
+                    continue
+                try:
+                    weight = float(feature.get("weight", 1.0))
+                except (TypeError, ValueError):
+                    weight = 1.0
+                terms.append({"term": term, "weight": max(0.1, weight)})
+        if terms:
+            return terms
+
+    # Backward compatibility if features are missing.
+    if bucket == "key":
+        terms_raw = profile.get("symptoms", {}).get("required", []) if isinstance(profile.get("symptoms"), dict) else []
+        terms.extend({"term": _normalize_text(item), "weight": 1.0} for item in terms_raw if _normalize_text(item))
+    elif bucket == "supportive":
+        terms_raw = profile.get("symptoms", {}).get("common", []) if isinstance(profile.get("symptoms"), dict) else []
+        terms.extend({"term": _normalize_text(item), "weight": 0.6} for item in terms_raw if _normalize_text(item))
+    elif bucket == "rare":
+        terms_raw = profile.get("symptoms", {}).get("rare", []) if isinstance(profile.get("symptoms"), dict) else []
+        terms.extend({"term": _normalize_text(item), "weight": 0.35} for item in terms_raw if _normalize_text(item))
+    return terms
+
+
+def _semantic_topic_from_feature(feature: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9 ]", " ", feature.lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _build_deterministic_question_from_feature(
+    feature_term: str,
+    opposite_term: str,
+    top_two: List[str],
+    priority: str,
+) -> Dict[str, str]:
+    disease_1 = top_two[0] if len(top_two) > 0 else "Top diagnosis"
+    disease_2 = top_two[1] if len(top_two) > 1 else "Alternate diagnosis"
+    feature_label = feature_term.strip()
+    opposite_label = opposite_term.strip() if opposite_term else "a different competing pattern"
+    return {
+        "Question": f"Which statement best matches your symptoms regarding {feature_label}?",
+        "A": f"Yes, {feature_label} is clearly present",
+        "B": f"No, symptoms are closer to {opposite_label}",
+        "C": "Neither pattern fits clearly",
+        "D": f"I'm not sure about {feature_label}",
+        "E": "None of these / Not sure",
+        "allow_other": True,
+        "priority": priority,
+        "clinical_intent": f"Differentiate {disease_1} vs {disease_2} using feature-level evidence",
+        "differentiates_between": [disease_1, disease_2],
+        "feature_id": feature_label,
+        "question_source": "deterministic",
+    }
+
+
+def _deterministic_top2_and_feature(patient_state: Dict) -> Optional[Dict[str, Any]]:
+    _ensure_profiles_loaded()
+    demographics = patient_state.get("demographics") if isinstance(patient_state.get("demographics"), dict) else {}
+    age = demographics.get("age")
+    gender = demographics.get("gender")
+    positives = patient_state.get("identified_symptoms") if isinstance(patient_state.get("identified_symptoms"), list) else []
+    negatives = patient_state.get("negatives") if isinstance(patient_state.get("negatives"), list) else []
+    symptom_state = patient_state.get("symptom_state") if isinstance(patient_state.get("symptom_state"), dict) else {}
+    red_flags = symptom_state.get("red_flags") if isinstance(symptom_state.get("red_flags"), list) else patient_state.get("red_flags", [])
+    modifier_map = symptom_state.get("modifier_map") if isinstance(symptom_state.get("modifier_map"), dict) else symptom_state.get("modifiers")
+
+    if not positives:
+        return None
+
+    ranking = analyze_case(
+        age=age,
+        gender=gender,
+        symptoms=positives,
+        chat_history="Structured state only",
+        negatives=negatives,
+        modifiers=modifier_map,
+        red_flags=red_flags if isinstance(red_flags, list) else [],
+    )
+    conditions = ranking.get("conditions") if isinstance(ranking, dict) else []
+    if not isinstance(conditions, list) or len(conditions) < 1:
+        return None
+    top_condition = conditions[0] if isinstance(conditions[0], dict) else None
+    second_condition = conditions[1] if len(conditions) > 1 and isinstance(conditions[1], dict) else None
+    if not top_condition:
+        return None
+    top_name = str(top_condition.get("name", "")).strip()
+    second_name = str(second_condition.get("name", "")).strip() if second_condition else ""
+    top_two = [name for name in [top_name, second_name] if name]
+    if len(top_two) < 2:
+        # Fall back to current state differential names when rule engine returns one candidate.
+        top_two = _extract_top_two_condition_names(patient_state) or top_two
+    if len(top_two) < 2:
+        return None
+
+    profile_1 = _extract_profile_by_name(top_two[0])
+    profile_2 = _extract_profile_by_name(top_two[1])
+    if not profile_1 or not profile_2:
+        return None
+
+    asked_questions = _extract_asked_questions(patient_state)
+    known = _known_findings_set(patient_state)
+    red_flag_terms = set(_normalize_text(item) for item in (red_flags if isinstance(red_flags, list) else []) if _normalize_text(item))
+
+    top1_terms = _feature_terms(profile_1, "key") + _feature_terms(profile_1, "supportive") + _feature_terms(profile_1, "rare")
+    top2_terms = _feature_terms(profile_2, "key") + _feature_terms(profile_2, "supportive") + _feature_terms(profile_2, "rare")
+    top2_term_set = {str(item.get("term")) for item in top2_terms if str(item.get("term"))}
+    top1_term_set = {str(item.get("term")) for item in top1_terms if str(item.get("term"))}
+
+    candidates: List[Dict[str, Any]] = []
+    for feature in top1_terms:
+        term = str(feature.get("term", "")).strip()
+        if not term or term in known:
+            continue
+        if term in top2_term_set:
+            continue
+        if any(_jaccard(term, asked) >= 0.78 for asked in asked_questions):
+            continue
+        opposite = next((str(item.get("term")) for item in top2_terms if str(item.get("term")) not in known), "")
+        weight = float(feature.get("weight", 1.0) or 1.0)
+        red_priority = any(flag in term or term in flag for flag in red_flag_terms) if red_flag_terms else False
+        separation = 1.0
+        if opposite:
+            separation = max(0.1, 1.0 - _jaccard(term, opposite))
+        novelty = 1.0 if term not in known else 0.0
+        utility = (1.45 * weight) + (1.15 * separation) + (0.7 * novelty) + (1.0 if red_priority else 0.0)
+        candidates.append(
+            {
+                "term": term,
+                "opposite": opposite,
+                "utility": utility,
+                "priority": "red-flag" if red_priority else "high",
+            }
+        )
+
+    for feature in top2_terms:
+        term = str(feature.get("term", "")).strip()
+        if not term or term in known:
+            continue
+        if term in top1_term_set:
+            continue
+        if any(_jaccard(term, asked) >= 0.78 for asked in asked_questions):
+            continue
+        opposite = next((str(item.get("term")) for item in top1_terms if str(item.get("term")) not in known), "")
+        weight = float(feature.get("weight", 1.0) or 1.0)
+        red_priority = any(flag in term or term in flag for flag in red_flag_terms) if red_flag_terms else False
+        separation = 1.0
+        if opposite:
+            separation = max(0.1, 1.0 - _jaccard(term, opposite))
+        novelty = 1.0 if term not in known else 0.0
+        utility = (1.35 * weight) + (1.1 * separation) + (0.7 * novelty) + (1.0 if red_priority else 0.0)
+        candidates.append(
+            {
+                "term": term,
+                "opposite": opposite,
+                "utility": utility,
+                "priority": "red-flag" if red_priority else "high",
+            }
+        )
+
+    if not candidates:
+        return {
+            "top_two": top_two,
+            "ranking": ranking,
+            "feature": None,
+            "question": None,
+        }
+
+    candidates.sort(key=lambda item: float(item.get("utility", 0.0)), reverse=True)
+    selected = candidates[0]
+    question = _build_deterministic_question_from_feature(
+        feature_term=str(selected.get("term", "")),
+        opposite_term=str(selected.get("opposite", "")),
+        top_two=top_two,
+        priority=str(selected.get("priority", "high")),
+    )
+    return {
+        "top_two": top_two,
+        "ranking": ranking,
+        "feature": selected,
+        "question": question,
+    }
+
+
+def _build_chief_symptom_mcq(patient_state: Dict) -> Dict[str, str]:
+    symptoms = patient_state.get("identified_symptoms") if isinstance(patient_state.get("identified_symptoms"), list) else []
+    chief = ""
+    for item in symptoms:
+        term = _normalize_text(item)
+        if term:
+            chief = term
+            break
+    if not chief:
+        chief = _normalize_text(patient_state.get("chief_complaint", "")) or "main symptom"
+
+    lower = chief.lower()
+    if any(token in lower for token in {"abdominal", "stomach", "vomit", "diarrhea", "bowel"}):
+        return {
+            "Question": "Which digestive pattern best matches your current symptoms?",
+            "A": "Right-lower abdominal pain worsens with movement",
+            "B": "Diffuse abdominal symptoms with loose stools or vomiting",
+            "C": "Upper-abdominal burning discomfort linked to meals",
+            "D": "Bloating or gas mostly after eating",
+            "E": "None of these / Not sure",
+            "allow_other": True,
+            "priority": "high",
+            "clinical_intent": "Differentiate inflammatory surgical, infectious, and acid-peptic abdominal patterns",
+            "differentiates_between": ["Top suspect #1", "Top suspect #2"],
+            "feature_id": "digestive_pattern",
+            "question_source": "deterministic",
+        }
+
+    if any(token in lower for token in {"cough", "breath", "chest", "wheeze", "phlegm"}):
+        return {
+            "Question": "Which respiratory feature is most prominent right now?",
+            "A": "Breathlessness or wheeze episodes with chest tightness",
+            "B": "Productive cough with colored sputum and fever",
+            "C": "Dry cough with throat irritation and minimal sputum",
+            "D": "Chest pain that worsens with deep breathing",
+            "E": "None of these / Not sure",
+            "allow_other": True,
+            "priority": "high",
+            "clinical_intent": "Differentiate airway-reactive, bacterial, and viral respiratory patterns",
+            "differentiates_between": ["Top suspect #1", "Top suspect #2"],
+            "feature_id": "respiratory_pattern",
+            "question_source": "deterministic",
+        }
+
+    if any(token in lower for token in {"headache", "dizziness", "weakness", "numb", "balance"}):
+        return {
+            "Question": "Which neurological feature best describes your current condition?",
+            "A": "One-sided weakness/numbness or speech disturbance",
+            "B": "Severe throbbing headache with light sensitivity",
+            "C": "Spinning dizziness without focal weakness",
+            "D": "Gradual memory or concentration difficulties",
+            "E": "None of these / Not sure",
+            "allow_other": True,
+            "priority": "high",
+            "clinical_intent": "Differentiate focal neurological, migraine, and vestibular patterns",
+            "differentiates_between": ["Top suspect #1", "Top suspect #2"],
+            "feature_id": "neurological_pattern",
+            "question_source": "deterministic",
+        }
+
+    return {
+        "Question": f"Which associated pattern best matches your current {chief}?",
+        "A": f"Localized and persistent {chief} in one area",
+        "B": f"{chief} with systemic features like fever or fatigue",
+        "C": f"Trigger-linked episodic {chief} that comes and goes",
+        "D": f"{chief} that started suddenly and is severe",
+        "E": "None of these / Not sure",
+        "allow_other": True,
+        "priority": "high",
+        "clinical_intent": f"Differentiate competing causes of {chief} using symptom pattern context",
+        "differentiates_between": ["Top suspect #1", "Top suspect #2"],
+        "feature_id": chief,
+        "question_source": "deterministic",
+    }
+
+
+def _build_alternate_contextual_mcq(patient_state: Dict, asked_questions: List[str]) -> Dict[str, str]:
+    positives = patient_state.get("identified_symptoms") if isinstance(patient_state.get("identified_symptoms"), list) else []
+    positives = [str(item).strip() for item in positives if str(item).strip()]
+    red_flags = patient_state.get("red_flags") if isinstance(patient_state.get("red_flags"), list) else []
+    red_flags = [str(item).strip() for item in red_flags if str(item).strip()]
+
+    opt_a = positives[0] if len(positives) > 0 else "localized pain pattern"
+    opt_b = positives[1] if len(positives) > 1 else "systemic fever/chills pattern"
+    opt_c = red_flags[0] if red_flags else "intermittent trigger-linked pattern"
+    opt_d = positives[2] if len(positives) > 2 else "gradual worsening over days"
+
+    candidate = {
+        "Question": "Which of these associated findings is most clearly present now?",
+        "A": f"Mainly {opt_a}",
+        "B": f"Mainly {opt_b}",
+        "C": f"Mainly {opt_c}",
+        "D": f"Mainly {opt_d}",
+        "E": "None of these / Not sure",
+        "allow_other": True,
+        "priority": "red-flag" if red_flags else "high",
+        "clinical_intent": "Capture the most discriminative associated feature from current structured findings",
+        "differentiates_between": ["Top suspect #1", "Top suspect #2"],
+        "feature_id": "associated_feature_focus",
+        "question_source": "deterministic",
+    }
+
+    if _is_repeated_question(candidate.get("Question", ""), asked_questions):
+        candidate["Question"] = "Which change best reflects your symptom pattern since the last question?"
+    return candidate
+
+
+def build_contextual_fallback_mcq(patient_state: Dict) -> Union[Dict, str]:
+    """
+    Build a symptom-based MCQ fallback when LLM is unavailable.
+    Does NOT use any disease dataset — driven entirely by chief symptom patterns.
+    """
+    turn_count = int(patient_state.get("turn_count", 0) or 0)
+    asked_questions = _extract_asked_questions(patient_state)
+
+    if turn_count >= 12:
+        return "Ready for diagnosis"
+
+    fallback = _build_chief_symptom_mcq(patient_state)
+    if not _is_repeated_question(fallback.get("Question", ""), asked_questions):
+        return fallback
+
+    alternate = _build_alternate_contextual_mcq(patient_state, asked_questions)
+    if not _is_repeated_question(alternate.get("Question", ""), asked_questions):
+        return alternate
+
+    return _build_alternate_contextual_mcq(patient_state, asked_questions)
+
+
+def _validate_mcq_quality(mcq: Dict, patient_state: Dict) -> (bool, str):
+    question = str(mcq.get("Question", "")).strip()
+    a = str(mcq.get("A", "")).strip()
+    b = str(mcq.get("B", "")).strip()
+    c = str(mcq.get("C", "")).strip()
+    d = str(mcq.get("D", "")).strip()
+    e = str(mcq.get("E", "")).strip()
+    combined = " ".join([question, a, b, c, d, e]).lower()
+
+    if not question or not a or not b or not c or not d:
+        return False, "missing_required_fields"
+    if _contains_placeholder_text(combined):
+        return False, "placeholder_text_detected"
+    if _is_generic_question(question):
+        return False, "generic_question_detected"
+
+    asked_questions = _extract_asked_questions(patient_state)
+    if _is_repeated_question(question, asked_questions):
+        return False, "repeated_question_detected"
+
+    option_keys = {_normalize_text(a), _normalize_text(b), _normalize_text(c), _normalize_text(d)}
+    if len(option_keys) < 4:
+        return False, "non_distinct_options"
+
+    # E must be the escape-hatch option
+    e_norm = _normalize_text(e)
+    if e and "none" not in e_norm and "not sure" not in e_norm:
+        return False, "invalid_option_e"
+
+    return True, "ok"
 
 
 def get_followup_from_state(
@@ -28,345 +562,169 @@ def get_followup_from_state(
     max_retries: int = 1,
 ) -> Union[Dict, str, None]:
     """
-    Generate a follow-up MCQ question using Pure LLM Sequential Differential Diagnosis.
-    
-    This function follows the "Senior Diagnostic Consultant" approach:
-    1. Evidence Analysis: Analyze all previous patient responses
-    2. Differential Mapping: Generate ranked list of 3-5 most likely conditions
-    3. Gap Identification: Identify critical information to differentiate top 2 conditions
-    4. Next-Best-Question (NBQ): Generate single most relevant follow-up question
-    
+    Generate a follow-up MCQ question using pure LLM clinical reasoning.
+
+    No disease dataset is used. The LLM analyzes the patient's symptoms and
+    full conversation history and applies 4-step clinical reasoning to select
+    the single most useful next question.
+
     Args:
         patient_state: Structured patient state dictionary
         top_diseases: (Deprecated - kept for compatibility)
         disease_engine: (Deprecated - kept for compatibility)
         entropy_tracker: (Deprecated - kept for compatibility)
-        max_retries: Maximum retry attempts for parsing
-        
+        max_retries: (Deprecated - kept for compatibility)
+
     Returns:
-        - dict: parsed MCQ with keys "Question","A","B","C","D"
+        - dict: MCQ with keys "Question", "A", "B", "C", "D", "E"
         - str: "Ready for diagnosis"
-        - None: on error/unrecoverable
+        - None: on unrecoverable error
     """
+    del top_diseases, disease_engine, entropy_tracker, max_retries
+    turn_count = int(patient_state.get("turn_count", 0) or 0)
+    if turn_count >= 12:
+        return "Ready for diagnosis"
+
+    asked_questions = _extract_asked_questions(patient_state)
+
+    # Symptom-based fallback MCQ (no disease dataset used)
+    fallback_mcq = build_contextual_fallback_mcq(patient_state)
+    if isinstance(fallback_mcq, str) and "ready for diagnosis" in fallback_mcq.lower():
+        return "Ready for diagnosis"
+    if not isinstance(fallback_mcq, dict):
+        fallback_mcq = _build_chief_symptom_mcq(patient_state)
+
+    if _is_repeated_question(str(fallback_mcq.get("Question", "")), asked_questions):
+        if turn_count >= 12:
+            return "Ready for diagnosis"
+        fallback_mcq = _build_alternate_contextual_mcq(patient_state, asked_questions)
+
     from utils.gemini_api_manager import get_gemini_model
     model_available, model = get_gemini_model()
-    
     if not model_available or model is None:
-        logger.error("Model is not available. Cannot generate content.")
-        return None
-    
-    # Convert state to formatted string
-    state_str = state_to_prompt_string(patient_state)
-    
-    # Get previous differential diagnosis from state (if exists)
-    previous_differential = patient_state.get("differential_diagnosis", [])
-    differential_str = ""
-    if previous_differential:
-        differential_str = "\n\nPREVIOUS DIFFERENTIAL DIAGNOSIS:\n"
-        for idx, condition in enumerate(previous_differential[:5], 1):
-            name = condition.get("name", "Unknown")
-            confidence = condition.get("confidence", "Unknown")
-            reasoning = condition.get("reasoning", "")
-            differential_str += f"{idx}. {name} (Confidence: {confidence})\n"
-            if reasoning:
-                differential_str += f"   Reasoning: {reasoning[:100]}...\n"
-    
-    turn_count = patient_state.get('turn_count', 0)
-    
-    # Check for emergency red flags in identified symptoms
-    emergency_detected = False
-    emergency_keywords = [
-        "chest pain", "severe chest pain", "difficulty breathing", "severe difficulty breathing",
-        "loss of consciousness", "stroke", "severe headache", "severe abdominal pain",
-        "severe bleeding", "cardiac", "heart attack", "myocardial infarction"
-    ]
-    identified_symptoms = patient_state.get("identified_symptoms", [])
-    for symptom in identified_symptoms:
-        symptom_lower = str(symptom).lower()
-        if any(keyword in symptom_lower for keyword in emergency_keywords):
-            emergency_detected = True
-            break
-    
-    # Get last patient answer for clarification check
-    last_answer = ""
-    chat_history = patient_state.get("chat_history", [])
-    if chat_history and len(chat_history) > 0:
-        last_msg = chat_history[-1]
-        if isinstance(last_msg, dict) and "user" in last_msg:
-            last_answer = last_msg.get("user", "")
-    
-    # Extract age, gender, symptoms from patient_state for the prompt
-    demographics = patient_state.get("demographics", {})
+        return fallback_mcq
+
+    symptom_state = patient_state.get("symptom_state") if isinstance(patient_state.get("symptom_state"), dict) else {}
+    demographics = patient_state.get("demographics") if isinstance(patient_state.get("demographics"), dict) else {}
     age = demographics.get("age", "Unknown")
     gender = demographics.get("gender", "Unknown")
-    identified_symptoms = patient_state.get("identified_symptoms", [])
-    symptoms = ", ".join(identified_symptoms) if identified_symptoms else patient_state.get("chief_complaint", "Unknown")
-    
-    # Format chat_history as string
-    chat_history_str = ""
-    if chat_history and isinstance(chat_history, list):
-        formatted_messages = []
-        for msg in chat_history:
-            if isinstance(msg, dict):
-                if "bot" in msg:
-                    formatted_messages.append(f"AI: {msg['bot']}")
-                elif "user" in msg:
-                    formatted_messages.append(f"Patient: {msg['user']}")
-        chat_history_str = "\n".join(formatted_messages) if formatted_messages else "No previous conversation."
-    else:
-        chat_history_str = "No previous conversation."
-    
-    # Build prompt for Professional B2B Clinical Co-Pilot Engine
-    # Enforce strict 7-12 turn range (8 for emergencies)
-    emergency_min_turns = 8
-    general_min_turns = 7
-    
-    if emergency_detected:
-        if turn_count < emergency_min_turns:
-            # Emergency: Must complete 8 questions for Clinical Triage Packet
-            stop_logic = f"CONTINUE: Emergency suspected. Complete minimum {emergency_min_turns} questions for Clinical Triage Packet. Current: {turn_count}/{emergency_min_turns}"
-        elif turn_count >= 12:
-            stop_logic = "STOP NOW: Turn count reached 12. Reply ONLY 'Ready for diagnosis'."
-        else:
-            # Emergency: 8-12 range, can stop if clear
-            stop_logic = f"STOP if: Top DDx probability plateau reached (no significant information gain) AND turn_count ({turn_count}) is {emergency_min_turns}-12\nCONTINUE if: More triage data needed AND turn_count < 12"
-    else:
-        if turn_count < general_min_turns:
-            # General: Must complete 7 questions minimum
-            stop_logic = f"CONTINUE: Complete minimum {general_min_turns} questions. Current: {turn_count}/{general_min_turns}"
-        elif turn_count >= 12:
-            stop_logic = "STOP NOW: Turn count reached 12. Reply ONLY 'Ready for diagnosis'."
-        else:
-            # General: 7-12 range - check for plateau
-            stop_logic = f"STOP if ANY condition met:\n   - Top DDx probability plateau (no significant information gain) AND turn_count ({turn_count}) is {general_min_turns}-12\n   - Turn count reaches 12\nCONTINUE if: More information needed AND turn_count < 12 AND information gain > 5%"
-    
-    # Emergency handling: Clinical Triage Packet requirements
-    emergency_note = ""
-    triage_packet_requirements = ""
-    if emergency_detected:
-        if turn_count < emergency_min_turns:
-            triage_packet_requirements = f"""
-CRITICAL: Gather Clinical Triage Packet (minimum {emergency_min_turns} questions):
-- Onset: When did symptoms start? Acute vs gradual?
-- PQRST Pain Assessment: Provocation/Palliation, Quality, Region/Radiation, Severity (0-10), Timing
-- Relevant PMH: Past medical history, medications, allergies
-- Associated Negatives: What symptoms are absent (helps rule out differentials)
-- Vital Signs Context: Any reported fever, BP, HR changes?
-Current Progress: {turn_count}/{emergency_min_turns}"""
-            emergency_note = f"\n🚨 HIGH-ACUITY CASE DETECTED: {triage_packet_requirements}"
-        else:
-            emergency_note = f"\n🚨 HIGH-ACUITY CASE: Clinical Triage Packet complete ({emergency_min_turns} questions). May stop if diagnosis clear."
-    
-    # Professional clinical terminology guide
-    clinical_terminology_note = """
-USE CLINICAL TERMINOLOGY (Professional B2B Mode):
-- "dyspnea" not "shortness of breath"
-- "syncope" not "fainting"
-- "tachycardia" not "fast heart rate"
-- "hemoptysis" not "coughing up blood"
-- "melena" not "black stool"
-- Use precise medical terms appropriate for clinician-to-clinician communication"""
-    
-    base_prompt = f"""
-ACT: Senior Clinical Consultant - Professional Diagnostic Co-Pilot (B2B Mode).
-ROLE: You are a clinical decision support tool for Doctors and Nurses. No patient-facing language.
-CASE: {age}yo {gender} presenting with: {symptoms}.
+    positives = symptom_state.get("current_symptoms") if isinstance(symptom_state.get("current_symptoms"), list) else patient_state.get("identified_symptoms", [])
+    negatives = patient_state.get("negatives") if isinstance(patient_state.get("negatives"), list) else []
+    red_flags = symptom_state.get("red_flags") if isinstance(symptom_state.get("red_flags"), list) else patient_state.get("red_flags", [])
 
-CURRENT TURN: {turn_count} (Range: {general_min_turns if not emergency_detected else emergency_min_turns}-12 questions)
-{emergency_note}
+    positives_text = ", ".join(str(s).strip() for s in positives if str(s).strip()) or "None"
+    negatives_text = ", ".join(str(s).strip() for s in negatives if str(s).strip()) or "None"
+    red_flags_text = ", ".join(str(s).strip() for s in red_flags if str(s).strip()) or "None"
+    full_history_text = _format_chat_history(patient_state)
+    asked_questions = symptom_state.get("questions_asked", [])
+    previously_asked_titles = "\n".join(f"- {q}" for q in asked_questions) or "None"
+    chief_complaint = str(patient_state.get("chief_complaint", "")).strip() or positives_text
 
-CONTEXT (Medical History):
-{chat_history_str}
+    # BMI Context
+    bmi_data = demographics.get("bmi", {})
+    bmi_text = ""
+    if bmi_data:
+        bmi_text = f" | BMI: {bmi_data.get('value')} ({bmi_data.get('category')})"
+        if bmi_data.get('is_estimated'):
+            bmi_text += " (Estimated)"
 
-SEQUENTIAL CLINICAL REASONING (MANDATORY):
-1. UPDATE DIFFERENTIAL DIAGNOSIS (DDx) LEADERBOARD: Rank top 3-5 suspected conditions based on:
-   - Symptom pattern match (pathophysiology alignment)
-   - Demographics (age, gender)
-   - Clinical history evidence
-   - Negative findings (what's ruled out)
-   
-2. CALCULATE INFORMATION GAIN: Identify the 'Differentiator Symptom' that provides maximum information gain to separate:
-   - Suspect #1 (top DDx) from Suspect #2 (second most likely)
-   This symptom/feature should strongly support one while ruling out the other.
+    # Fix C: Build differential diagnosis context from stored state
+    differential = patient_state.get("differential_diagnosis") if isinstance(patient_state.get("differential_diagnosis"), list) else []
+    diff_text = "Not yet established."
+    if differential:
+        diff_lines = []
+        for idx, item in enumerate(differential[:3], 1):
+            if isinstance(item, dict):
+                name = str(item.get("name", "")).strip()
+                confidence = str(item.get("confidence", "")).strip()
+                reasoning = str(item.get("reasoning", "")).strip()
+                if name:
+                    diff_lines.append(f"  #{idx}: {name} ({confidence}) — {reasoning[:80]}")
+        if diff_lines:
+            diff_text = "\n".join(diff_lines)
 
-3. GENERATE CLINICALLY PRECISE FOLLOW-UP QUESTION:
-   - Focus EXCLUSIVELY on the Differentiator Symptom
-   - Use professional medical terminology (see guide below)
-   - Be specific and clinically meaningful
-   - Probe for quantitative data when relevant (duration, severity scales, frequencies)
+    # Build differentiator hint
+    differentiator = str(patient_state.get("differentiator_symptom", "")).strip()
+    differentiator_text = f"\n- Key differentiator to confirm: {differentiator}" if differentiator else ""
 
-{clinical_terminology_note}
+    # Running summary for quick context
+    running_summary = str(patient_state.get("running_summary", "")).strip()
+    summary_text = f"\n- Clinical summary so far: {running_summary[:200]}" if running_summary else ""
 
-TERMINATION LOGIC:
-{stop_logic}
+    prompt = f"""Clinical diagnostician. Ask the SINGLE highest-yield next question to separate the top differential diagnoses.
 
-OUTPUT FORMAT:
-- If STOPPING: Reply ONLY the exact string: "Ready for diagnosis"
-- If CONTINUING: Return JSON ONLY (no markdown, no explanations):
-{{"Question":"Clinically precise question focused on Differentiator Symptom","A":"Option 1","B":"Option 2","C":"Option 3","D":"None of these"}}
+PATIENT: {age}/{gender}{bmi_text} | Chief: {chief_complaint}
++Confirmed: {positives_text}
+-Ruled out: {negatives_text}
+Red flags: {red_flags_text}
+Turn {turn_count + 1}/12{summary_text}{differentiator_text}
 
-REMEMBER: This is B2B clinical decision support. Be direct, technical, and evidence-focused. No patient counseling language.
+DIFFERENTIAL (current top suspects):
+{diff_text}
+
+ALREADY ASKED (never repeat or paraphrase):
+{previously_asked_titles}
+
+CONVERSATION:
+{full_history_text}
+
+SELECT NEXT QUESTION:
+1. Target the one feature that best splits Suspect #1 vs #2. Feature priority: pathognomonic sign > red-flag > severity/functional impact > timing/onset/trigger > location/radiation.
+2. Must add NEW info: not already in confirmed/ruled-out, not similar to any asked question.
+3. Stay within the most likely body system (GI, hepatic, respiratory, cardiac, neuro, urinary, musculoskeletal, endocrine, derm) unless a red flag forces otherwise.
+4. 5-10 plain-English words, no jargon. A-D clinically distinct and mutually exclusive; E = "Not sure / None of these".
+
+EARLY STOP: if turn >= 12, OR top suspect is High-confidence with key differentiators already answered → return {{"ready_for_diagnosis": true}}
+
+Return STRICT JSON only, no markdown:
+{{"Question":"...","A":"...","B":"...","C":"...","D":"...","E":"Not sure / None of these"}}
 """
 
-    # Check if API keys are available before attempting
-    from utils.gemini_api_manager import _load_api_keys
-    available_keys = _load_api_keys()
-    if not available_keys or len(available_keys) == 0:
-        logger.error("get_followup_from_state: NO API KEYS AVAILABLE! Cannot generate question.")
-        logger.error("   Please set at least one API key: GEMINI_API_KEY_1 through GEMINI_API_KEY_15")
-        logger.error("   Or legacy: GOOGLE_API_KEY or GEMINI_API_KEY")
-        # Return None - this will be handled by caller
-        return None
-    
-    logger.info(f"get_followup_from_state: Attempting generation with {len(available_keys)} available API key(s)")
-    
-    # Try ALL available API keys (up to 15) when one fails - ensure maximum reliability
-    # max_retries=None will use all available keys automatically
     success, raw_text, error = generate_content_with_fallback(
-        prompt=base_prompt,
-        max_retries=None,  # Use all available keys (up to 15) - ensures maximum fallback reliability
-        temperature=0.3,
-        max_output_tokens=1000  # SPEED FIX: Reduced from 2000 to 1000 (questions are short)
+        prompt=prompt,
+        max_retries=None,
+        temperature=0.2,
+        max_output_tokens=500,
     )
-    
-    if not success:
-        error_details = error or "Unknown error"
-        logger.error("="*80)
-        logger.error(f"get_followup_from_state: API call failed after trying {len(available_keys)} available API key(s)")
-        logger.error(f"   Error details: {error_details}")
-        logger.error("="*80)
-        
-        # Check for specific error types to provide better error context
-        error_lower = error_details.lower() if error_details else ""
-        if "timeout" in error_lower or "timed out" in error_lower:
-            logger.error(f"   → ERROR TYPE: Timeout - All {len(available_keys)} API keys timed out or request exceeded 30s timeout")
-        elif "quota" in error_lower or "rate limit" in error_lower or "429" in error_details:
-            logger.error(f"   → ERROR TYPE: Quota/Rate limit - All {len(available_keys)} API keys exhausted quotas or hit rate limits")
-        elif "api key" in error_lower or "401" in error_details or "403" in error_details or "invalid" in error_lower:
-            logger.error(f"   → ERROR TYPE: API key authentication - All {len(available_keys)} API keys may be invalid, expired, or unauthorized")
-            logger.error(f"   → ACTION REQUIRED: Check API keys in .env file or environment variables")
-        elif "no working" in error_lower or "exhausted" in error_lower:
-            logger.error(f"   → ERROR TYPE: All keys failed - All {len(available_keys)} API keys were tried but none succeeded")
-        else:
-            logger.error(f"   → ERROR TYPE: General API error - {error_details}")
-        logger.error("="*80)
-        
-        # Return None to let caller handle retry logic
-        # The error is logged above for debugging
-        return None
-    
-    if not raw_text:
-        logger.error("get_followup_from_state: Generated content is empty")
-        return None
-    
-    raw_text = raw_text.strip()
-    
-    # Normalize the special Ready reply
-    if raw_text.strip().strip('"').strip("'").lower() == "ready for diagnosis":
+    if not success or not raw_text:
+        logger.warning("get_followup_from_state: LLM generation failed: %s", error)
+        fallback_mcq.setdefault("E", "None of these / Not sure")
+        fallback_mcq.setdefault("question_source", "deterministic")
+        return fallback_mcq
+
+    parsed = extract_json_from_text(raw_text.strip())
+    # Fix B: Honor early stop at any turn when LLM has high confidence
+    if isinstance(parsed, dict) and bool(parsed.get("ready_for_diagnosis")):
         return "Ready for diagnosis"
-    
-    # FIX: Use robust JSON extraction like followup.py (handles markdown, extra text, etc.)
-    from Followup_Generation.followup import _strip_code_fences, _extract_first_json_object, _safe_parse_json_like
-    
-    # Clean and extract JSON using same methods as followup.py
-    cleaned = _strip_code_fences(raw_text)
-    json_sub = _extract_first_json_object(cleaned)
-    
-    parsed = None
-    parsing_error = None
-    
-    if json_sub:
-        try:
-            parsed = _safe_parse_json_like(json_sub)
-        except Exception as e:
-            parsing_error = e
-            error_msg = str(e)
-            logger.warning(f"get_followup_from_state: Failed to parse extracted JSON: {error_msg}")
-    else:
-        # If no JSON substring found, try parsing whole cleaned text
-        try:
-            parsed = _safe_parse_json_like(cleaned)
-        except Exception as e:
-            parsing_error = e
-            error_msg = str(e)
-            logger.warning(f"get_followup_from_state: Failed to parse cleaned text: {error_msg}")
-    
-    # Fallback: try extract_json_from_text if above methods failed
-    if parsed is None:
-        try:
-            parsed_json = extract_json_from_text(raw_text)
-            if parsed_json and isinstance(parsed_json, dict):
-                parsed = parsed_json
-        except Exception as e:
-            logger.warning(f"get_followup_from_state: extract_json_from_text also failed: {e}")
-    
-    # If JSON parsing failed due to truncation/unterminated string, retry with reformat prompt
-    if parsed is None and parsing_error:
-        error_msg = str(parsing_error)
-        if "unterminated" in error_msg.lower() or "truncated" in error_msg.lower() or "expecting" in error_msg.lower():
-            logger.warning("="*80)
-            logger.warning("⚠️ JSON parsing failed due to truncated/unterminated response")
-            logger.warning(f"   Error: {error_msg}")
-            logger.warning("   Retrying with reformat prompt to get complete JSON...")
-            logger.warning("="*80)
-            
-            # Retry with a reformat prompt asking for complete JSON
-            reformat_prompt = (
-                "Your previous response had truncated JSON. Please return ONLY complete, valid JSON:\n"
-                '{"Question":"Complete question text here","A":"Option A","B":"Option B","C":"Option C","D":"None of these"}\n\n'
-                "IMPORTANT: Ensure the JSON is complete and all string values are properly closed."
-            )
-            
-            retry_success, retry_text, retry_error = generate_content_with_fallback(
-                prompt=raw_text[:500] + "\n\n" + reformat_prompt,  # Use first 500 chars + reformat prompt
-                max_retries=None,  # Try all available keys (up to 15) if first fails
-                temperature=0.3,
-                max_output_tokens=1000
-            )
-            
-            if retry_success and retry_text:
-                logger.info("   ✅ Retry successful, attempting to parse reformatted response...")
-                # Try parsing the retry response
-                retry_cleaned = _strip_code_fences(retry_text)
-                retry_json_sub = _extract_first_json_object(retry_cleaned)
-                
-                if retry_json_sub:
-                    try:
-                        parsed = _safe_parse_json_like(retry_json_sub)
-                        logger.info("   ✅ Successfully parsed reformatted JSON")
-                    except Exception as retry_e:
-                        logger.warning(f"   ⚠️ Retry response still failed to parse: {retry_e}")
-                else:
-                    try:
-                        parsed = _safe_parse_json_like(retry_cleaned)
-                        logger.info("   ✅ Successfully parsed reformatted text")
-                    except Exception as retry_e:
-                        logger.warning(f"   ⚠️ Retry response still failed to parse: {retry_e}")
-            else:
-                logger.warning(f"   ⚠️ Retry API call failed: {retry_error}")
-    
-    if parsed and isinstance(parsed, dict):
-        # Normalize keys
+
+    if isinstance(parsed, dict):
         from Followup_Generation.followup import _normalize_mcq_keys, _validate_mcq_structure
         normalized = _normalize_mcq_keys(parsed)
-        
-        # Validate structure before returning
         if _validate_mcq_structure(normalized):
-            # Ensure option D equals "None of these"
-            normalized["D"] = "None of these"
-            logger.info(f"get_followup_from_state: Successfully generated question: {normalized.get('Question', 'N/A')[:50]}...")
-            return normalized
-        else:
-            logger.error(f"get_followup_from_state: MCQ structure validation failed. Keys: {normalized.keys()}")
-            logger.debug(f"get_followup_from_state: Parsed dict preview: {str(normalized)[:200]}...")
-    else:
-        # Log detailed error for debugging
-        logger.error(f"get_followup_from_state: JSON parsing failed. Response length: {len(raw_text) if raw_text else 0}")
-        logger.error(f"get_followup_from_state: Raw response preview (first 500 chars): {raw_text[:500] if raw_text else 'None'}...")
-        logger.error(f"get_followup_from_state: Parsed result type: {type(parsed)}")
-    
-    # FIX: Return None only after all parsing attempts fail - let caller handle retry
-    return None
+            # Enforce E = escape-hatch option; keep D as a real clinical option
+            normalized.setdefault("E", "None of these / Not sure")
+            e_val = _normalize_text(str(normalized.get("E", "")))
+            if "none" not in e_val and "not sure" not in e_val:
+                normalized["E"] = "None of these / Not sure"
+            ok, reason = _validate_mcq_quality(normalized, patient_state)
+            if ok:
+                normalized.setdefault("allow_other", True)
+                normalized.setdefault("priority", fallback_mcq.get("priority", "high"))
+                normalized.setdefault("clinical_intent", fallback_mcq.get("clinical_intent", "Identify most likely diagnosis from patient history"))
+                normalized.setdefault("differentiates_between", fallback_mcq.get("differentiates_between", []))
+                normalized.setdefault("question_source", "llm")
+                # NOTE: Do NOT append to questions_asked here. The websocket
+                # handler (app.py) is the single source of truth and records the
+                # question only after it is actually selected and sent. Tracking
+                # it here caused the generated question to match itself during the
+                # caller's repeat-check, so every LLM question was wrongly
+                # rejected as "repeated" and replaced by a deterministic fallback.
+                return normalized
+            logger.warning("get_followup_from_state: LLM MCQ rejected (%s), using fallback", reason)
+
+    fallback_mcq.setdefault("E", "None of these / Not sure")
+    fallback_mcq.setdefault("question_source", "deterministic")
+    return fallback_mcq
 
 
 def analyze_answer_for_state(
@@ -398,80 +756,46 @@ def analyze_answer_for_state(
     # Get patient demographics for context
     age = current_state.get("demographics", {}).get("age", "Unknown")
     gender = current_state.get("demographics", {}).get("gender", "Unknown")
+    symptom_state = current_state.get("symptom_state") if isinstance(current_state.get("symptom_state"), dict) else {}
+    modifier_map = symptom_state.get("modifier_map") if isinstance(symptom_state.get("modifier_map"), dict) else {}
+    red_flags = symptom_state.get("red_flags") if isinstance(symptom_state.get("red_flags"), list) else current_state.get("red_flags", [])
     
-    prompt = f"""
-You are analyzing a patient's answer and updating the diagnostic reasoning.
+    prompt = f"""Update the diagnostic reasoning from the latest answer. Patient: {age}/{gender}. Apply India-specific context (tropical/endemic disease, lifestyle) where relevant.
 
-CURRENT PATIENT STATE:
+STATE:
 {state_str}
+Modifiers: {json.dumps(modifier_map, ensure_ascii=False)}
+Red flags: {json.dumps(red_flags, ensure_ascii=False)}
+Q: {question}
+A: {answer}
 
-QUESTION ASKED: {question}
-PATIENT ANSWER: {answer}
+DO:
+1. Add NEW symptoms from the answer to identified_symptoms; anything ruled out by the answer to negatives.
+2. Set confidence_score 0.0-1.0 by strength of evidence so far.
+3. Rank EXACTLY 3 differentials (most->least likely). Each: name (specific condition), confidence (High>=70% | Moderate 50-70% | Low<50%), reasoning (1-2 sentences anchored to the findings/negatives, consistent with the confidence).
+4. differentiator_symptom: the single feature that most strongly separates Suspect #1 vs #2.
+5. running_summary: 2-3 clinical sentences (key findings, top suspect, next differentiator) for report reuse.
 
-TASK: Extract structured information and generate a differential diagnosis.
-
-STEP 1: Extract Information
-1. Any NEW symptoms mentioned in the answer (add to identified_symptoms)
-2. Any symptoms/conditions RULED OUT by the answer (add to negatives)
-3. Update confidence_score (0.0 to 1.0) based on how much information we have
-
-STEP 2: Generate Differential Diagnosis (Top 3 Suspects)
-Based on ALL available information (including this new answer), generate EXACTLY 3 most likely conditions.
-Rank them as: Suspect #1 (most likely), Suspect #2, Suspect #3.
-
-For each condition, provide:
-- name: Specific medical condition name
-- confidence: "High" (≥70%), "Moderate" (50-70%), or "Low" (<50%)
-- reasoning: Brief 1-2 sentence explanation of why this condition fits
-
-STEP 3: Identify Differentiator Symptom
-Compare Suspect #1 vs Suspect #2:
-- Identify the ONE symptom/feature that would:
-  * STRONGLY support Suspect #1 if present
-  * STRONGLY support Suspect #2 if absent (or vice versa)
-- This is the "Differentiator Symptom" - the critical piece of information needed next
-
-Consider:
-- Patient demographics (Age: {age}, Gender: {gender})
-- All identified symptoms and their patterns
-- Negative findings (what's ruled out)
-- India-specific context (tropical diseases, lifestyle factors)
-
-Return ONLY valid JSON in this format:
+Return ONLY valid JSON:
 {{
-  "identified_symptoms": ["new symptom 1", "new symptom 2"],
-  "negatives": ["ruled out symptom/condition"],
+  "identified_symptoms": ["..."],
+  "negatives": ["..."],
   "confidence_score": 0.75,
   "differential_diagnosis": [
-    {{
-      "name": "Suspect #1 - Most Likely Condition",
-      "confidence": "High|Moderate|Low",
-      "reasoning": "Brief explanation of why this fits"
-    }},
-    {{
-      "name": "Suspect #2 - Second Most Likely",
-      "confidence": "Moderate",
-      "reasoning": "Brief explanation"
-    }},
-    {{
-      "name": "Suspect #3 - Third Most Likely",
-      "confidence": "Low",
-      "reasoning": "Brief explanation"
-    }}
+    {{"name": "...", "confidence": "High|Moderate|Low", "reasoning": "..."}},
+    {{"name": "...", "confidence": "High|Moderate|Low", "reasoning": "..."}},
+    {{"name": "...", "confidence": "High|Moderate|Low", "reasoning": "..."}}
   ],
-  "differentiator_symptom": "The one symptom/feature that differentiates Suspect #1 from Suspect #2",
-  "running_summary": "Concise clinical summary (2-3 sentences) of key findings, top suspect, and critical differentiator. This will be used for fast report generation."
+  "differentiator_symptom": "...",
+  "running_summary": "..."
 }}
-
-Generate EXACTLY 3 conditions in the differential diagnosis, ranked by likelihood.
-The running_summary should be concise and clinical - it will be used to speed up final report generation.
 """
 
     success, raw_text, error = generate_content_with_fallback(
         prompt=prompt,
         max_retries=None,  # Try all available API keys (up to 15) if first fails
         temperature=0.2,
-        max_output_tokens=2000
+        max_output_tokens=1100
     )
     
     if not success or not raw_text:
@@ -485,4 +809,3 @@ The running_summary should be concise and clinical - it will be used to speed up
         return parsed_json
     
     return None
-

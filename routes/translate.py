@@ -269,7 +269,7 @@ def translate_with_gemini_fallback(text: str, target_lang: str) -> str:
         if not GEMINI_AVAILABLE:
             return text
         
-        print(f"🤖 Using Gemini fallback for {target_lang}")
+        logger.info("Using Gemini fallback for %s", target_lang)
         
         # Sanitize PII
         sanitized_text = sanitize_pii(text)
@@ -290,7 +290,7 @@ TEXT TO TRANSLATE:
 {sanitized_text}"""
         
         # Call Gemini
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-3.1-flash-lite-preview')
         response = model.generate_content(
             prompt,
             generation_config=genai.types.GenerationConfig(
@@ -302,13 +302,13 @@ TEXT TO TRANSLATE:
         if response and response.text:
             translated = response.text.strip()
             if translated and len(translated) > 0:
-                print(f"✅ Gemini translation: {translated[:80]}...")
+                logger.info("Gemini translation: %s...", translated[:80])
                 return translated
         
         return text
         
     except Exception as e:
-        print(f"❌ Gemini error: {str(e)}")
+        logger.error("Gemini translation error: %s", e)
         return text
 
 
@@ -321,7 +321,7 @@ def translate_text_smart(text: str, target_lang: str) -> str:
     # Try Google Cloud Translation FIRST (if configured)
     if TRANSLATE_AVAILABLE and GCLOUD_PROJECT_ID:
         try:
-            print(f"🌐 [Google Cloud] Translating to {target_lang}: {text[:100]}...")
+            logger.info("[Google Cloud] Translating to %s: %s...", target_lang, text[:100])
             
             # Sanitize PII
             sanitized_text = sanitize_pii(text)
@@ -356,19 +356,20 @@ def translate_text_smart(text: str, target_lang: str) -> str:
                 for placeholder, abbrev in abbrev_map.items():
                     translated = translated.replace(placeholder, abbrev)
                 
-                print(f"✅ [Google Cloud] Translation successful!")
-                print(f"   Original (EN): {sanitized_text[:60]}...")
-                print(f"   Translated ({target_lang.upper()}): {translated[:60]}...")
+                logger.info(
+                    "[Google Cloud] Translation successful: %s -> %s",
+                    sanitized_text[:60],
+                    translated[:60],
+                )
                 return translated
             
         except Exception as e:
-            print(f"⚠️  [Google Cloud] Failed: {str(e)}")
-            logger.warning(f"Google Cloud failed: {str(e)}, trying Gemini...")
+            logger.warning("Google Cloud failed: %s, trying Gemini...", e)
     
     # Fall back to Gemini if Google Cloud fails
     if GEMINI_AVAILABLE:
         try:
-            print(f"🤖 [Gemini] Translating to {target_lang}: {text[:100]}...")
+            logger.info("[Gemini] Translating to %s: %s...", target_lang, text[:100])
             
             # Sanitize PII
             sanitized_text = sanitize_pii(text)
@@ -387,7 +388,7 @@ Return ONLY the translated sentence. No explanation. No quotes.
 TEXT TO TRANSLATE:
 {sanitized_text}"""
             
-            model = genai.GenerativeModel('gemini-1.5-flash')
+            model = genai.GenerativeModel('gemini-3.1-flash-lite-preview')
             response = model.generate_content(
                 prompt,
                 generation_config=genai.types.GenerationConfig(
@@ -399,20 +400,21 @@ TEXT TO TRANSLATE:
             if response and response.text:
                 translated = response.text.strip()
                 if translated and len(translated) > 0:
-                    print(f"✅ [Gemini] Translation successful!")
-                    print(f"   Original (EN): {text[:60]}...")
-                    print(f"   Translated ({target_lang.upper()}): {translated[:60]}...")
+                    logger.info(
+                        "[Gemini] Translation successful: %s -> %s",
+                        text[:60],
+                        translated[:60],
+                    )
                     return translated
             
-            print(f"⚠️  Gemini returned empty response")
+            logger.warning("Gemini returned empty response")
             return text
             
         except Exception as e:
-            print(f"❌ [Gemini] Error: {str(e)}")
-            logger.error(f"Gemini translation failed: {str(e)}")
+            logger.error("Gemini translation failed: %s", e)
             return text
     else:
-        print(f"❌ No translation service available")
+        logger.warning("No translation service available")
         return text
 
 
@@ -463,25 +465,17 @@ async def translate_text(
             # Check cache
             cached = translation_cache.get(text, target_lang)
             if cached:
-                logger.info(f"💾 Cache hit for language: {target_lang}")
-                print(f"💾 Cache hit! Returning cached translation")
+                logger.info("Cache hit for language: %s", target_lang)
                 return TranslationResponse(translated=cached)
             
-            # Translate using smart translation (Google Cloud or Gemini)
-            print(f"\n{'='*60}")
-            print(f"📥 TRANSLATION REQUEST:")
-            print(f"   Language: {target_lang}")
-            print(f"   Text: {text[:100]}...")
-            print(f"{'='*60}\n")
-            
+            logger.info("Translation request: lang=%s text=%s...", target_lang, text[:100])
             translated = translate_text_smart(text, target_lang)
-            
-            print(f"\n{'='*60}")
-            print(f"📤 TRANSLATION RESULT:")
-            print(f"   Original: {text[:100]}...")
-            print(f"   Translated: {translated[:100]}...")
-            print(f"   Same as original? {text == translated}")
-            print(f"{'='*60}\n")
+            logger.info(
+                "Translation result: original=%s... translated=%s... unchanged=%s",
+                text[:100],
+                translated[:100],
+                text == translated,
+            )
             
             # Cache result
             translation_cache.set(text, target_lang, translated)
@@ -499,7 +493,7 @@ async def translate_text(
                 # Check cache first
                 cached = translation_cache.get(item, target_lang)
                 if cached:
-                    print(f"💾 Cache hit for item {len(translated_items) + 1}")
+                    logger.info("Cache hit for batch item %s", len(translated_items) + 1)
                     translated_items.append(cached)
                 else:
                     # Translate using smart translation (Google Cloud or Gemini)

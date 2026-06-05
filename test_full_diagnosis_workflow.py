@@ -169,12 +169,9 @@ def test_report_generation(session_id):
     }
     
     try:
-        # Try to generate report
-        response = requests.post(
-            f"{BASE_URL}/generate_report",
-            json={"session_id": session_id},
-            headers={"Content-Type": "application/json"},
-            timeout=60  # Report generation can take time
+        response = requests.get(
+            f"{BASE_URL}/generate_report/{session_id}",
+            timeout=60
         )
         
         if response.status_code == 200:
@@ -218,31 +215,21 @@ def test_pdf_generation(session_id):
     
     print_info(f"Generating PDF for session: {session_id}")
     
+    print_info("PDF is generated client-side from /generate_report JSON (no /download_pdf endpoint)")
+    
     try:
         response = requests.get(
-            f"{BASE_URL}/download_report/{session_id}",
-            timeout=30
+            f"{BASE_URL}/generate_report/{session_id}",
+            timeout=60
         )
         
         if response.status_code == 200:
-            # Save PDF to file
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"test_report_{session_id}_{timestamp}.pdf"
-            
-            with open(filename, 'wb') as f:
-                f.write(response.content)
-            
-            file_size = len(response.content) / 1024  # KB
-            print_success(f"PDF generated successfully!")
-            print_info(f"Saved to: {filename}")
-            print_info(f"File size: {file_size:.2f} KB")
-            
-            if file_size > 10:  # PDF should be at least 10KB
-                print_success("PDF appears to be valid (size check passed)")
-                return True
-            else:
-                print_warning("PDF file seems too small, might be corrupted")
-                return False
+            data = response.json()
+            report_payload = json.dumps(data)
+            file_size = len(report_payload.encode("utf-8")) / 1024
+            print_success("Report JSON available for client-side PDF generation")
+            print_info(f"Report payload size: {file_size:.2f} KB")
+            return file_size > 1
         else:
             print_error(f"PDF generation failed: {response.status_code}")
             print_error(f"Response: {response.text[:200]}")

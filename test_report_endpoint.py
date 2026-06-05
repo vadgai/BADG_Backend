@@ -44,7 +44,7 @@ try:
         
         import google.generativeai as genai
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.0-flash-exp")
+        model = genai.GenerativeModel("gemini-3.1-flash-lite-preview")
         print("   ✅ Gemini model initialized")
         
         # Test a simple generation

@@ -7,31 +7,58 @@ from typing import Any, Dict, List
 
 def build_signal_extraction_prompt(
     current_state: Dict[str, Any],
-    patient_response: str
+    patient_response: str,
+    last_question_text: str = None
 ) -> str:
-    return f"""You are a medical NLP expert. Extract ONLY clinically relevant information from this patient response.
+    last_q = last_question_text or current_state.get("last_question_text") or current_state.get("last_question") or "None"
+    modifier_map = current_state.get("modifier_map") if isinstance(current_state.get("modifier_map"), dict) else {}
 
-Current known symptoms: {current_state.get('current_symptoms', [])}
-Current modifiers: {current_state.get('modifiers', [])}
-Current red flags: {current_state.get('red_flags', [])}
+    # Fix K: add differential and red flags for context-aware extraction
+    differential = current_state.get("differential_diagnosis") if isinstance(current_state.get("differential_diagnosis"), list) else []
+    diff_text = ""
+    if differential:
+        diff_names = [str(d.get("name", "")).strip() for d in differential[:3] if isinstance(d, dict) and d.get("name")]
+        if diff_names:
+            diff_text = f"\n- Current Top Suspects (differential): {', '.join(diff_names)}"
 
-Patient's latest response: "{patient_response}"
+    red_flags = current_state.get("red_flags") if isinstance(current_state.get("red_flags"), list) else []
+    red_flags_text = ""
+    if red_flags:
+        red_flags_text = f"\n- Known Red Flags: {', '.join(str(r).strip() for r in red_flags if str(r).strip())}"
 
-Extract and return ONLY:
-1. New symptoms (medical terms only)
-2. Modifiers (severity, duration, triggers, location, character)
-3. Red flags (alarming symptoms requiring immediate attention)
+    return f"""Medical scribe. Extract clinical signals from the patient answer. JSON only.
 
-Return STRICT JSON format:
+CONTEXT:
+- Current symptoms: {current_state.get('current_symptoms', [])}
+- Modifier map: {modifier_map}{diff_text}{red_flags_text}
+- Last question: "{last_q}"
+- Patient answer: "{patient_response}"
+
+RULES:
+1. NORMALIZE to concise clinical terms ("weight lost"->"weight loss", "stomach hurts"->"abdominal pain").
+2. NEGATIVES: if the patient denies the last question, add its topic to new_negative_findings.
+3. RED FLAGS: capture life-threatening mentions (chest pain, loss of consciousness, severe breathing difficulty, etc.).
+4. MODIFIERS: fill any present among duration, onset, location, quality, severity, aggravating_factors, relieving_factors, associated_symptoms.
+5. NO HALLUCINATION: only findings explicitly stated in the answer.
+6. Use the Top Suspects to judge which positives are diagnostically meaningful.
+
+OUTPUT JSON ONLY:
 {{
-  "new_symptoms": ["symptom1", "symptom2"],
-  "new_modifiers": ["modifier1"],
-  "red_flags": ["flag1"],
-  "clinical_value": true/false
-}}
-
-If response contains NO new clinical information, return {{"clinical_value": false}}.
-NO explanations. ONLY JSON."""
+  "new_positive_findings": ["term1", "term2"],
+  "new_negative_findings": ["term1"],
+  "red_flags_detected": [],
+  "modifier_map": {{
+    "duration": "",
+    "onset": "",
+    "location": "",
+    "quality": "",
+    "severity": "",
+    "aggravating_factors": [],
+    "relieving_factors": [],
+    "associated_symptoms": []
+  }},
+  "clinical_utility": true
+}}"""
 
 
 def build_next_question_prompt(
@@ -41,39 +68,41 @@ def build_next_question_prompt(
     questions_asked: List[str]
 ) -> str:
     questions_text = "\n".join(questions_asked) if questions_asked else "None"
-    return f"""You are a medical diagnosis expert. Generate ONE highly specific follow-up question.
+    question_count = len(questions_asked)
+    return f"""ACT: Senior Clinical Consultant (Symptom-Driven Mode).
+GOAL: Generate ONE differentiating MCQ using structured symptom state only.
 
-Patient: {age}-year-old {gender}
-
-Current Clinical State:
-- Symptoms: {symptom_state.get('current_symptoms', [])}
+CONTEXT:
+- Patient: {age}yo {gender}
+- Confirmed Symptoms (+): {symptom_state.get('current_symptoms', [])}
 - Modifiers: {symptom_state.get('modifiers', [])}
+- Modifier Map: {symptom_state.get('modifier_map', {})}
 - Red Flags: {symptom_state.get('red_flags', [])}
-- Questions Already Asked: {len(questions_asked)}
-
-Questions previously covered:
+- Questions Already Asked: {question_count}
+- Previously Asked Questions:
 {questions_text}
 
-Task:
-1. Infer TOP 2 most likely diseases based on current state
-2. Generate ONE question that differentiates between them
-3. Prioritize red flags if present
-4. DO NOT repeat previous questions
-5. DO NOT ask generic questions
-
-If you have enough information (minimum 7 questions asked and clear diagnosis), return:
+STRICT RULES:
+1. Use ONLY structured state above; do not use raw chat history or free-form assumptions.
+2. Infer TOP 2 competing diseases from (+), modifiers, red flags, and demographics.
+3. Ask ONE targeted differentiator question only (non-repetitive).
+4. Prioritize red-flag differentiation whenever red flags are present.
+5. Never use placeholder/template wording in the question or options.
+6. Never ask generic filler/progression checks unless required by red-flag differentiation.
+7. If evidence is limited, ask the single highest-value differentiator linked to known symptoms (not a generic progression question).
+8. The question must test a concrete differentiator feature between top-2 conditions.
+9. If question_count >= 10 OR (question_count >= 7 and diagnosis is sufficiently certain), return:
 {{"ready_for_diagnosis": true}}
 
-Otherwise, return STRICT JSON format:
+OUTPUT JSON ONLY:
 {{
-  "Question": "Specific, targeted question based on symptoms",
-  "A": "Option A",
-  "B": "Option B", 
-  "C": "Option C",
+  "Question": "Is abdominal pain localized to the right lower side and worse with movement?",
+  "A": "Yes, localized right-lower pain worsens while walking/coughing",
+  "B": "No, pain is diffuse with loose stools or vomiting",
+  "C": "No, pain is mainly upper-abdominal burning after meals",
   "D": "None of these",
-  "priority": "red-flag | high | medium",
-  "clinical_intent": "What this question distinguishes",
-  "differentiates_between": ["Disease A", "Disease B"]
-}}
-
-NO explanations. ONLY JSON."""
+  "priority": "red-flag|high|medium",
+  "clinical_intent": "What this differentiates",
+  "differentiates_between": ["Appendicitis", "Gastroenteritis"],
+  "feature_id": "feature_key"
+}}"""

@@ -51,7 +51,8 @@ try:
         is_database_available,
         get_reports_collection,
         get_visits_collection,
-        get_contact_submissions_collection
+        get_contact_submissions_collection,
+        get_report_analyzer_submissions_collection,
     )
     DB_CONNECTION_AVAILABLE = True
 except ImportError:
@@ -74,6 +75,8 @@ except ImportError:
     def get_visits_collection():
         return None
     def get_contact_submissions_collection():
+        return None
+    def get_report_analyzer_submissions_collection():
         return None
 
 # Try to import auth modules, but make them optional
@@ -125,6 +128,8 @@ from in_memory_storage import (
     get_reports_from_memory,
     get_contacts_from_memory,
     get_dashboard_stats_from_memory,
+    get_report_analyzer_submissions_from_memory,
+    delete_report_analyzer_submission_from_memory,
     in_memory_visits,
     in_memory_reports,
     in_memory_contacts
@@ -967,6 +972,90 @@ async def get_contact_by_id(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Error fetching contact data"
+        )
+
+
+@router.get("/report-analyzer-submissions")
+async def get_report_analyzer_submissions(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    current_admin=Depends(get_current_admin),
+):
+    """
+    Get paginated medical report analyzer submissions for the admin dashboard.
+    """
+    try:
+        collection = get_report_analyzer_submissions_collection()
+
+        if is_database_available() and collection is not None:
+            total = await collection.count_documents({})
+            submissions = []
+            async for doc in collection.find({}).sort("timestamp", -1).skip(skip).limit(limit):
+                if doc.get("_id") is not None:
+                    doc["_id"] = str(doc["_id"])
+                submissions.append(doc)
+            return {
+                "total": total,
+                "skip": skip,
+                "limit": limit,
+                "submissions": submissions,
+            }
+
+        memory_result = get_report_analyzer_submissions_from_memory(skip=skip, limit=limit)
+        return memory_result
+
+    except Exception as e:
+        logger.error("Error fetching report analyzer submissions: %s", str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error fetching report analyzer submissions",
+        )
+
+
+@router.delete("/report-analyzer-submissions/{submission_id}")
+async def delete_report_analyzer_submission(
+    submission_id: str,
+    current_admin=Depends(get_current_admin),
+):
+    """Delete a report analyzer submission by ID."""
+    try:
+        collection = get_report_analyzer_submissions_collection()
+
+        if is_database_available() and collection is not None:
+            from bson import ObjectId
+            from bson.errors import InvalidId
+
+            query = {"_id": submission_id}
+            try:
+                query = {"_id": ObjectId(submission_id)}
+            except (InvalidId, TypeError):
+                query = {"_id": submission_id}
+
+            result = await collection.delete_one(query)
+            if result.deleted_count == 0:
+                result = await collection.delete_one({"_id": submission_id})
+            if result.deleted_count == 0:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Submission not found",
+                )
+            return {"success": True, "message": "Submission deleted successfully"}
+
+        deleted = delete_report_analyzer_submission_from_memory(submission_id)
+        if not deleted:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Submission not found",
+            )
+        return {"success": True, "message": "Submission deleted successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Error deleting report analyzer submission %s: %s", submission_id, str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error deleting submission",
         )
 
 

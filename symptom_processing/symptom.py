@@ -59,15 +59,19 @@ def clarify_symptoms(text):
         logger.warning("Model not available for symptom clarification")
         return "[]"
     
-    prompt = f"""You are a medical expert. Extract only medical symptoms from the sentence below.
-Respond WITH A SINGLE JSON ARRAY and nothing else. Example: ["headache", "fever"]
+    prompt = f"""You are a clinical NLP extractor.
+TASK: Extract only patient-reported symptoms from the sentence.
+STRICT:
+- Include symptoms only (no diagnoses, no medicines, no tests, no advice).
+- Normalize to concise medical symptom terms.
+- Return WITH A SINGLE JSON ARRAY and nothing else. Example: ["headache", "fever"].
 
 Sentence: "{text}"
 Return only the JSON array (no text, no Markdown, no explanation)."""
 
-    retry_prompt = """Previous response could not be parsed. PLEASE RETURN ONLY a JSON array in this exact format:
+    retry_prompt = """Previous response could not be parsed. RETURN ONLY a JSON array in this exact format:
 ["symptom1","symptom2"]
-Do not include any other text."""
+No markdown, no explanation, no extra keys."""
     
     try:
         success, response_text, error = generate_content_with_fallback(

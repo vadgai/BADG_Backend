@@ -6,6 +6,7 @@ Enhanced version with guaranteed question generation and clinical reasoning.
 
 import os
 import json
+import math
 import logging
 from typing import Optional, Union, Dict, List
 from dotenv import load_dotenv
@@ -225,19 +226,105 @@ def _convert_to_mcq_format(data: Dict) -> Dict:
     if "follow_up_questions" in data and data["follow_up_questions"]:
         # Extract first question from structured format
         first_q = data["follow_up_questions"][0]
-        return {
+        clinical_purpose = first_q.get("clinical_purpose") or first_q.get("clinical_focus", "")
+        differentiates = first_q.get("differentiates_between")
+        if not differentiates:
+            differentiates = data.get("current_differential") or data.get("top_differentials") or []
+        mcq = {
             "Question": first_q.get("question", ""),
             "A": first_q.get("options", {}).get("A", "Option A"),
             "B": first_q.get("options", {}).get("B", "Option B"),
             "C": first_q.get("options", {}).get("C", "Option C"),
             "D": "None of these",
-            "clinical_purpose": first_q.get("clinical_purpose", ""),
-            "differentiates_between": first_q.get("differentiates_between", [])
+            "clinical_purpose": clinical_purpose,
+            "differentiates_between": differentiates,
         }
+        for key in ("branch_switch_triggered", "red_flag_triggered"):
+            if key in data:
+                mcq[key] = data[key]
+        return mcq
     return data
 
 
 # ==================== IMPROVED CLINICAL PROMPT ====================
+
+def _format_history_v2(chat_history: Union[str, List, None]) -> str:
+    """Compact Q/A formatter to reduce token usage while preserving context."""
+    if not chat_history:
+        return "No previous questions asked"
+    if isinstance(chat_history, str):
+        return chat_history.strip() or "No previous questions asked"
+    if isinstance(chat_history, list):
+        lines = []
+        q_idx = 0
+        for i, msg in enumerate(chat_history):
+            if not isinstance(msg, dict):
+                continue
+            q = msg.get("bot") or msg.get("Question")
+            if q:
+                q_idx += 1
+                lines.append(f"Q{q_idx}: {str(q).strip()}")
+                if i + 1 < len(chat_history):
+                    nxt = chat_history[i + 1]
+                    if isinstance(nxt, dict) and nxt.get("user"):
+                        lines.append(f"A{q_idx}: {str(nxt.get('user')).strip()}")
+        return "\n".join(lines) if lines else "No previous questions asked"
+    return "No previous questions asked"
+
+
+def _extract_last_answer_v2(chat_history: Union[str, List, None]) -> str:
+    """Get latest patient answer from history for context grounding."""
+    if not chat_history:
+        return "None"
+    if isinstance(chat_history, str):
+        try:
+            chat_history = json.loads(chat_history)
+        except Exception:
+            return "None"
+    if isinstance(chat_history, list):
+        for msg in reversed(chat_history):
+            if isinstance(msg, dict) and msg.get("user"):
+                return str(msg.get("user")).strip() or "None"
+    return "None"
+
+
+def _build_bmi_signal(weight: Optional[Union[int, float, str]], height: Optional[Union[int, float, str]]) -> Dict[str, Union[bool, float, str, None]]:
+    """
+    Safe BMI signal for prompt grounding.
+    Returns structured data and never raises.
+    """
+    fallback = {
+        "available": False,
+        "value": None,
+        "category": "Unknown",
+        "text": "BMI not available",
+    }
+    try:
+        if weight is None or height is None:
+            return fallback
+        w = float(weight)
+        h = float(height)
+        if not math.isfinite(w) or not math.isfinite(h) or w <= 0 or h <= 0:
+            return fallback
+        if 0.5 <= h <= 2.5:
+            h *= 100.0
+        elif 36 <= h <= 96:
+            h *= 2.54
+        if not (20 <= w <= 400 and 90 <= h <= 250):
+            return fallback
+        bmi = w / ((h / 100.0) ** 2)
+        if not math.isfinite(bmi) or bmi <= 0 or bmi > 80:
+            return fallback
+        bmi_cat = "Underweight" if bmi < 18.5 else "Normal" if bmi < 25 else "Overweight" if bmi < 30 else "Obese"
+        bmi_value = round(bmi, 1)
+        return {
+            "available": True,
+            "value": bmi_value,
+            "category": bmi_cat,
+            "text": f"BMI: {bmi_value:.1f} ({bmi_cat})",
+        }
+    except Exception:
+        return fallback
 
 def _build_clinical_prompt(
     age: int,
@@ -245,7 +332,7 @@ def _build_clinical_prompt(
     symptoms: Union[str, List],
     chat_history: str,
     question_count: int,
-    max_questions: int = 10,
+    max_questions: int = 8,
     weight: float = None,
     height: float = None,
     occupation: str = None,
@@ -259,144 +346,69 @@ def _build_clinical_prompt(
     
     symptoms_str = ", ".join(symptoms) if isinstance(symptoms, list) else str(symptoms)
     patient_context = f"{age}-year-old {gender.lower()}"
-    
-    # Build patient profile with available data
-    profile_details = []
-    
-    # BMI calculation (only if both weight and height available)
-    if weight and height:
-        try:
-            bmi = float(weight) / ((float(height) / 100) ** 2)
-            if bmi > 0:
-                bmi_cat = "Underweight" if bmi < 18.5 else "Normal" if bmi < 25 else "Overweight" if bmi < 30 else "Obese"
-                profile_details.append(f"BMI: {bmi:.1f} ({bmi_cat})")
-        except:
-            pass
-    
-    if occupation:
-        profile_details.append(f"Occupation: {occupation}")
-    if physical_activity:
-        profile_details.append(f"Physical Activity: {physical_activity}")
-    if diet_type:
-        profile_details.append(f"Diet: {diet_type}")
-    if location and isinstance(location, dict):
-        loc_parts = [location.get("city"), location.get("state"), location.get("country")]
-        loc_str = ", ".join([p for p in loc_parts if p])
-        if loc_str:
-            profile_details.append(f"Location: {loc_str}")
-    
-    profile_section = "\n".join([f"  - {d}" for d in profile_details]) if profile_details else "  - Limited demographic data"
-    
-    # Calculate confidence indicator
-    questions_answered = question_count
-    confidence_indicator = "LOW" if questions_answered < 3 else "MEDIUM" if questions_answered < 7 else "HIGH"
-    
-    prompt = f"""You are a CLINICAL AI DIAGNOSTIC ASSISTANT conducting a systematic medical interview.
 
-═══════════════════════════════════════════════════════════════════════════════
-PATIENT PROFILE
-═══════════════════════════════════════════════════════════════════════════════
-• Demographics: {patient_context}
-{profile_section}
+    bmi_signal = _build_bmi_signal(weight, height)
+    bmi_value = f"{bmi_signal['value']:.1f}" if bmi_signal.get("available") and bmi_signal.get("value") is not None else "Not available"
+    bmi_category = bmi_signal.get("category", "Unknown") if bmi_signal.get("available") else "Unknown"
 
-PRESENTING SYMPTOMS: {symptoms_str}
+    history_text = _format_history_v2(chat_history)
+    latest_answer = _extract_last_answer_v2(chat_history)
+    next_question_id = question_count + 1
 
-CONVERSATION HISTORY:
-{chat_history if chat_history else "No previous questions asked"}
+    prompt = f"""You are VADG-Clinical, a safe and efficient diagnostic reasoning engine.
+Language: English only.
 
-PROGRESS: Question {question_count + 1} of {max_questions} | Confidence: {confidence_indicator}
+GOAL: Identify the top 2 likely diseases with maximum Information Gain.
+Limit: Max 8 questions.
 
-═══════════════════════════════════════════════════════════════════════════════
-CLINICAL REASONING PROTOCOL
-═══════════════════════════════════════════════════════════════════════════════
+=== PATIENT CONTEXT ===
+Patient: {patient_context}
+BMI: {bmi_value} ({bmi_category})
+Presenting Symptoms: {symptoms_str}
+Current History:
+{history_text}
+Last Answer: "{latest_answer}"
+Question Count: {question_count}/{max_questions}
 
-STEP 1: DIFFERENTIAL DIAGNOSIS ANALYSIS
-▸ Analyze ALL symptoms and answers as a constellation
-▸ Identify TOP 3 most probable diseases based on:
-  - Symptom pattern matching
-  - Demographics (age, gender, location)
-  - Risk factors (BMI, occupation, lifestyle)
-  - Temporal patterns from history
+=== REASONING LOGIC ===
+1. **Analyze State**:
+   - If `Last Answer` was "None of these" (or negative), DISCARD the previous top hypothesis. Switch to the next most likely organ system/cause.
+   - If `Last Answer` was Positive, drill deeper into that specific condition.
 
-STEP 2: DISCRIMINATING FEATURE IDENTIFICATION
-▸ What SINGLE clinical feature would best differentiate between your top 3 diagnoses?
-▸ Priority order for questions:
-  1. RED FLAGS (life-threatening signs) - ALWAYS ask if not ruled out
-  2. PATHOGNOMONIC features (disease-specific symptoms)
-  3. Temporal patterns (onset, duration, progression)
-  4. Severity indicators (functional impact)
-  5. Associated symptoms (constellation patterns)
-  6. Risk factors and exposures
+2. **BMI Integration**:
+   - If BMI ≥ 30 (Obese): Prioritize metabolic, cardiovascular, and respiratory (OSA) conditions.
+   - If BMI < 18.5 (Underweight): Prioritize malabsorption, chronic infection, or metabolic disorders.
 
-STEP 3: DECISION POINT
-▸ IF confidence is HIGH (≥7 questions) AND you can differentiate top diagnoses → Return: {{"ready_for_diagnosis": true}}
-▸ IF confidence is LOW/MEDIUM OR critical differentiating info missing → Generate targeted question
-▸ IF reached question limit ({max_questions}) → Return: {{"ready_for_diagnosis": true}}
+3. **Termination**:
+   - If you have > 80% confidence in Top 1 disease OR Question Count >= 8:
+     Return "ready_for_diagnosis": true.
 
-═══════════════════════════════════════════════════════════════════════════════
-QUESTION QUALITY STANDARDS
-═══════════════════════════════════════════════════════════════════════════════
+4. **Question Generation**:
+   - Generate ONE high-value Multiple Choice Question (MCQ).
+   - The question must differentiate between your Top #1 and Top #2 suspects.
+   - Options must be mutually exclusive.
+   - Set "branch_switch_triggered" to true if you pivoted because the last answer was "None of these".
 
-✓ GOOD QUESTIONS (specific, discriminating):
-  • "Does the headache worsen when bending forward or lying flat?"
-    → Differentiates: Sinusitis vs Migraine vs Intracranial pressure
-  • "Is there blood or coffee-ground material in vomit?"
-    → Differentiates: GI bleeding vs Gastritis vs Food poisoning
-  • "Does the pain radiate to the left arm or jaw?"
-    → Differentiates: Cardiac ischemia vs Musculoskeletal pain
-
-✗ BAD QUESTIONS (vague, already answered):
-  • "Any other symptoms?" - TOO VAGUE
-  • "How are you feeling?" - NON-DISCRIMINATING
-  • Questions already answered in chat history - REDUNDANT
-
-═══════════════════════════════════════════════════════════════════════════════
-MANDATORY OUTPUT FORMAT
-═══════════════════════════════════════════════════════════════════════════════
-
-IF CONTINUING INTERVIEW (default for questions {question_count + 1} < {max_questions}):
+=== OUTPUT FORMAT (JSON ONLY) ===
 {{
   "follow_up_questions": [
     {{
-      "id": {question_count + 1},
-      "question": "Clear, patient-friendly question in simple language",
-      "clinical_purpose": "Brief explanation of what this determines",
-      "differentiates_between": ["Disease A", "Disease B", "Disease C"],
-      "red_flag_assessment": true/false,
+      "id": {next_question_id},
+      "question": "Clear, patient-friendly question text?",
+      "clinical_focus": "Differentiating [Disease A] vs [Disease B]",
       "options": {{
-        "A": "Option pointing toward Disease A presentation",
-        "B": "Option pointing toward Disease B presentation",
-        "C": "Option pointing toward Disease C or other presentation",
+        "A": "Specific Symptom A",
+        "B": "Specific Symptom B",
+        "C": "Specific Symptom C",
         "D": "None of these"
       }}
     }}
   ],
-  "confidence_level": "low|medium|high",
-  "top_differentials": ["Disease 1", "Disease 2", "Disease 3"],
+  "current_differential": ["Disease A", "Disease B"],
+  "branch_switch_triggered": false,
+  "red_flag_triggered": false,
   "ready_for_diagnosis": false
 }}
-
-IF READY FOR DIAGNOSIS (only if confidence HIGH and sufficient data):
-{{
-  "ready_for_diagnosis": true,
-  "confidence_level": "high",
-  "questions_answered": {question_count},
-  "top_differentials": ["Most likely disease", "Second likely", "Third likely"]
-}}
-
-═══════════════════════════════════════════════════════════════════════════════
-CRITICAL REQUIREMENTS
-═══════════════════════════════════════════════════════════════════════════════
-1. MUST return valid JSON (no markdown, no explanations outside JSON)
-2. MUST NOT return empty arrays - always generate at least 1 question OR ready_for_diagnosis
-3. MUST NOT ask questions already answered in chat history
-4. MUST ensure Option D is always "None of these"
-5. MUST base questions on clinical reasoning, not random inquiry
-6. MUST consider patient demographics and context in question selection
-
-═══════════════════════════════════════════════════════════════════════════════
-NOW: Apply clinical reasoning and generate your response as JSON only.
-═══════════════════════════════════════════════════════════════════════════════
 """
     
     return prompt
@@ -426,12 +438,16 @@ def get_followup_for_diagnosis_v2(
         NEVER returns None
     """
     
-    # Count existing questions
+    # Count existing bot questions from either list or string history
     question_count = 0
-    if chat_history:
+    if isinstance(chat_history, list):
+        for msg in chat_history:
+            if isinstance(msg, dict) and (msg.get("bot") or msg.get("Question")):
+                question_count += 1
+    elif isinstance(chat_history, str) and chat_history:
         question_count = chat_history.count("Question:") + chat_history.count("Q:")
     
-    max_questions = 10
+    max_questions = 8
     
     # Hard limit: if max questions reached, return ready
     if question_count >= max_questions:
@@ -457,7 +473,7 @@ def get_followup_for_diagnosis_v2(
             prompt=prompt,
             max_retries=None,  # Try all keys
             temperature=0.3,
-            max_output_tokens=1500,
+            max_output_tokens=1100,
         )
         
         if not success or not raw_text:

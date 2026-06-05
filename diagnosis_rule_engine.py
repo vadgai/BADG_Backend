@@ -1,13 +1,14 @@
 """
-Diagnosis Rule Engine with Disease Registry
-Provides rule-based and AI-enhanced medical diagnosis capabilities.
+Diagnosis Rule Engine with Disease Registry.
+Supports both disease schema families and returns traceable evidence scores.
 """
 
-import os
 import json
 import logging
-from typing import Dict, List, Any, Optional, Tuple
+import math
+import re
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -18,6 +19,233 @@ DISEASE_REGISTRY: Dict[str, Dict[str, Any]] = {}
 
 # Global disease profiles (processed for faster lookup)
 DISEASE_PROFILES: List[Dict[str, Any]] = []
+
+_EMERGENCY_NAME_HINTS = (
+    "infarction",
+    "stroke",
+    "anaphylaxis",
+    "sepsis",
+    "rupture",
+    "tamponade",
+    "ectopic",
+    "aneurysm",
+    "ards",
+    "encephalitis",
+)
+
+
+def _normalize_text(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text)
+
+
+def _dedupe_preserve(items: List[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for item in items:
+        term = _normalize_text(item)
+        if not term or term in seen:
+            continue
+        out.append(term)
+        seen.add(term)
+    return out
+
+
+def _to_weighted_features(value: Any, default_weight: float, source: str) -> List[Dict[str, Any]]:
+    features: List[Dict[str, Any]] = []
+    if isinstance(value, dict):
+        for raw_term, raw_weight in value.items():
+            term = _normalize_text(raw_term)
+            if not term:
+                continue
+            try:
+                weight = float(raw_weight)
+            except (TypeError, ValueError):
+                weight = default_weight
+            features.append({"term": term, "weight": max(0.1, weight), "source": source})
+    elif isinstance(value, list):
+        for item in value:
+            term = _normalize_text(item)
+            if term:
+                features.append({"term": term, "weight": default_weight, "source": source})
+    return features
+
+
+def _merge_weighted_features(*groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for group in groups:
+        for feature in group:
+            term = _normalize_text(feature.get("term"))
+            if not term:
+                continue
+            try:
+                weight = float(feature.get("weight", 1.0))
+            except (TypeError, ValueError):
+                weight = 1.0
+            current = merged.get(term)
+            if current is None or weight > float(current.get("weight", 0.0)):
+                merged[term] = {
+                    "term": term,
+                    "weight": weight,
+                    "source": feature.get("source", "unknown"),
+                }
+    return list(merged.values())
+
+
+# Fix I: clinical synonym expansion for common abbreviations and variants
+_CLINICAL_SYNONYMS: Dict[str, List[str]] = {
+    "rif pain": ["right lower abdominal pain", "right iliac fossa pain"],
+    "rif": ["right lower abdomen", "right iliac fossa"],
+    "luq": ["left upper quadrant", "left upper abdomen"],
+    "ruq": ["right upper quadrant", "right upper abdomen"],
+    "llq": ["left lower quadrant", "left lower abdomen"],
+    "rlq": ["right lower quadrant", "right lower abdomen"],
+    "sob": ["shortness of breath", "difficulty breathing", "breathlessness"],
+    "cp": ["chest pain"],
+    "ha": ["headache"],
+    "n/v": ["nausea", "vomiting"],
+    "n&v": ["nausea", "vomiting"],
+    "nv": ["nausea", "vomiting"],
+    "gi": ["gastrointestinal"],
+    "uti": ["urinary tract infection"],
+    "uri": ["upper respiratory infection"],
+    "urti": ["upper respiratory tract infection"],
+    "lrti": ["lower respiratory tract infection"],
+    "mi": ["myocardial infarction", "heart attack"],
+    "dvt": ["deep vein thrombosis"],
+    "pe": ["pulmonary embolism"],
+    "bp": ["blood pressure"],
+    "hr": ["heart rate"],
+    "abd pain": ["abdominal pain"],
+    "abd": ["abdominal", "abdomen"],
+    "stomach pain": ["abdominal pain"],
+    "tummy pain": ["abdominal pain"],
+    "belly pain": ["abdominal pain"],
+    "lost weight": ["weight loss"],
+    "losing weight": ["weight loss"],
+    "can't breathe": ["difficulty breathing", "shortness of breath"],
+    "trouble breathing": ["difficulty breathing", "shortness of breath"],
+    "hard to breathe": ["difficulty breathing", "shortness of breath"],
+    "feeling dizzy": ["dizziness", "vertigo"],
+    "spinning sensation": ["vertigo", "dizziness"],
+    "loose motion": ["diarrhea"],
+    "loose stools": ["diarrhea"],
+    "watery stools": ["diarrhea"],
+    "runny stool": ["diarrhea"],
+    "blood in urine": ["hematuria"],
+    "blood in stool": ["rectal bleeding", "melena"],
+    "black stool": ["melena"],
+    "dark stool": ["melena"],
+    "difficulty swallowing": ["dysphagia"],
+    "trouble swallowing": ["dysphagia"],
+    "burning urination": ["dysuria"],
+    "pain on urination": ["dysuria"],
+    "frequent urination": ["urinary frequency", "polyuria"],
+    "chest tightness": ["chest pain", "angina"],
+    "tight chest": ["chest pain", "angina"],
+    "racing heart": ["palpitations", "tachycardia"],
+    "heart racing": ["palpitations", "tachycardia"],
+    "high temperature": ["fever"],
+    "running fever": ["fever"],
+    "feeling hot": ["fever"],
+}
+
+
+def _expand_synonyms(term: str) -> List[str]:
+    """Expand a normalized term to include all known synonyms."""
+    expansions = [term]
+    lower_term = term.strip().lower()
+    if lower_term in _CLINICAL_SYNONYMS:
+        expansions.extend(_CLINICAL_SYNONYMS[lower_term])
+    # Partial match: check if any synonym key is a substring of the term
+    for key, values in _CLINICAL_SYNONYMS.items():
+        if key in lower_term or lower_term in key:
+            expansions.extend(values)
+    return list(dict.fromkeys(expansions))  # deduplicate preserving order
+
+
+def _feature_match(term: str, values: List[str]) -> bool:
+    if not term:
+        return False
+    # Expand the term to include synonyms before matching
+    expanded_terms = _expand_synonyms(term)
+    for candidate in expanded_terms:
+        for value in values:
+            if not value:
+                continue
+            if candidate == value or candidate in value or value in candidate:
+                return True
+    # Also expand values side for abbreviations in patient answers
+    for value in values:
+        expanded_values = _expand_synonyms(value)
+        for expanded_val in expanded_values:
+            if term == expanded_val or term in expanded_val or expanded_val in term:
+                return True
+    return False
+
+
+def _extract_age_ranges(disease_data: Dict[str, Any]) -> List[Tuple[int, int]]:
+    ranges: List[Tuple[int, int]] = []
+    risk = disease_data.get("risk_factors", {}) if isinstance(disease_data.get("risk_factors"), dict) else {}
+    age_range = risk.get("age_range", [])
+    if isinstance(age_range, list):
+        for item in age_range:
+            if isinstance(item, dict):
+                try:
+                    mn = int(item.get("min", 0))
+                    mx = int(item.get("max", 120))
+                except (TypeError, ValueError):
+                    continue
+                if mn <= mx:
+                    ranges.append((mn, mx))
+            elif isinstance(item, list) and len(item) == 2:
+                try:
+                    mn = int(item[0])
+                    mx = int(item[1])
+                except (TypeError, ValueError):
+                    continue
+                if mn <= mx:
+                    ranges.append((mn, mx))
+
+    typical_age = disease_data.get("typical_age_range")
+    if isinstance(typical_age, list) and len(typical_age) == 2:
+        try:
+            mn = int(typical_age[0])
+            mx = int(typical_age[1])
+            if mn <= mx:
+                ranges.append((mn, mx))
+        except (TypeError, ValueError):
+            pass
+
+    deduped: List[Tuple[int, int]] = []
+    seen = set()
+    for rng in ranges:
+        if rng in seen:
+            continue
+        deduped.append(rng)
+        seen.add(rng)
+    return deduped
+
+
+def _is_core_tier(disease_data: Dict[str, Any]) -> bool:
+    tier_value = _normalize_text(disease_data.get("tier") or disease_data.get("category"))
+    if tier_value in {"core", "common", "emergency"}:
+        return True
+    prevalence = _normalize_text(disease_data.get("prevalence"))
+    if prevalence == "common":
+        return True
+    urgency_indicators = disease_data.get("urgency_indicators")
+    return bool(isinstance(urgency_indicators, list) and urgency_indicators)
+
+
+def _is_emergency_candidate(disease_name: str, disease_data: Dict[str, Any]) -> bool:
+    urgency_indicators = disease_data.get("urgency_indicators")
+    if isinstance(urgency_indicators, list) and urgency_indicators:
+        return True
+    name = _normalize_text(disease_name)
+    return any(hint in name for hint in _EMERGENCY_NAME_HINTS)
 
 
 def load_diseases_from_folder(folder_path: Optional[str] = None) -> int:
@@ -57,7 +285,7 @@ def load_diseases_from_folder(folder_path: Optional[str] = None) -> int:
                 logger.warning(f"Invalid format in {json_file.name}: expected dict")
                 continue
             
-            disease_id = disease_data.get("id") or json_file.stem
+            disease_id = disease_data.get("id") or disease_data.get("code") or json_file.stem
             disease_name = disease_data.get("name", "Unknown Disease")
             
             if disease_id in DISEASE_REGISTRY:
@@ -84,34 +312,70 @@ def build_disease_profiles() -> List[Dict[str, Any]]:
         List of disease profiles with normalized symptom lists and metadata
     """
     global DISEASE_REGISTRY, DISEASE_PROFILES
-    
-    profiles = []
-    
+
+    profiles: List[Dict[str, Any]] = []
     for disease_id, disease_data in DISEASE_REGISTRY.items():
+        name = str(disease_data.get("name", "Unknown")).strip()
+        symptoms_block = disease_data.get("symptoms", {}) if isinstance(disease_data.get("symptoms"), dict) else {}
+
+        required_list = _dedupe_preserve(symptoms_block.get("required", []) if isinstance(symptoms_block.get("required"), list) else [])
+        common_list = _dedupe_preserve(symptoms_block.get("common", []) if isinstance(symptoms_block.get("common"), list) else [])
+        rare_list = _dedupe_preserve(symptoms_block.get("rare", []) if isinstance(symptoms_block.get("rare"), list) else [])
+
+        key_features = _to_weighted_features(disease_data.get("key_symptoms"), default_weight=1.1, source="key_symptoms")
+        supportive_features = _to_weighted_features(
+            disease_data.get("supportive_symptoms"),
+            default_weight=0.7,
+            source="supportive_symptoms",
+        )
+        exclude_features = _to_weighted_features(
+            disease_data.get("exclude_symptoms"),
+            default_weight=0.9,
+            source="exclude_symptoms",
+        )
+
+        weighted_required = _to_weighted_features(required_list, default_weight=1.0, source="symptoms.required")
+        weighted_common = _to_weighted_features(common_list, default_weight=0.6, source="symptoms.common")
+        weighted_rare = _to_weighted_features(rare_list, default_weight=0.35, source="symptoms.rare")
+
+        risk = disease_data.get("risk_factors", {}) if isinstance(disease_data.get("risk_factors"), dict) else {}
+        genders = [str(g).strip().lower() for g in (risk.get("gender") if isinstance(risk.get("gender"), list) else []) if str(g).strip()]
+
+        age_ranges = _extract_age_ranges(disease_data)
         profile = {
-            "id": disease_id,
-            "name": disease_data.get("name", "Unknown"),
-            "organ_system": disease_data.get("organ_system", "General"),
+            "id": str(disease_id),
+            "name": name,
+            "organ_system": str(disease_data.get("organ_system", "General")).strip(),
             "symptoms": {
-                "required": [s.lower().strip() for s in disease_data.get("symptoms", {}).get("required", [])],
-                "common": [s.lower().strip() for s in disease_data.get("symptoms", {}).get("common", [])],
-                "rare": [s.lower().strip() for s in disease_data.get("symptoms", {}).get("rare", [])]
+                "required": required_list,
+                "common": common_list,
+                "rare": rare_list,
+            },
+            "features": {
+                "key": _merge_weighted_features(key_features, weighted_required),
+                "supportive": _merge_weighted_features(supportive_features, weighted_common),
+                "rare": _merge_weighted_features(weighted_rare),
+                "exclude": exclude_features,
             },
             "risk_factors": {
-                "age_range": disease_data.get("risk_factors", {}).get("age_range", []),
-                "gender": disease_data.get("risk_factors", {}).get("gender", []),
-                "bmi_range": disease_data.get("risk_factors", {}).get("bmi_range", []),
-                "other": disease_data.get("risk_factors", {}).get("other", [])
+                "age_ranges": age_ranges,
+                "age_range": age_ranges,
+                "gender": genders,
+                "other": risk.get("other", []) if isinstance(risk.get("other"), list) else [],
             },
-            "urgency_indicators": [s.lower().strip() for s in disease_data.get("urgency_indicators", [])],
-            "prevalence": disease_data.get("prevalence", "common"),  # common, uncommon, rare
+            "urgency_indicators": _dedupe_preserve(
+                disease_data.get("urgency_indicators", []) if isinstance(disease_data.get("urgency_indicators"), list) else []
+            ),
+            "prevalence": str(disease_data.get("prevalence", "unknown")).strip().lower() or "unknown",
             "diagnostic_criteria": disease_data.get("diagnostic_criteria", []),
-            "raw_data": disease_data  # Keep original for reference
+            "is_core_tier": _is_core_tier(disease_data),
+            "is_emergency_candidate": _is_emergency_candidate(name, disease_data),
+            "raw_data": disease_data,
         }
         profiles.append(profile)
-    
+
     DISEASE_PROFILES = profiles
-    logger.info(f"✅ Built {len(profiles)} disease profile(s)")
+    logger.info("✅ Built %s disease profile(s)", len(profiles))
     return profiles
 
 
@@ -122,7 +386,10 @@ def score_disease_match(
     gender: Optional[str] = None,
     weight: Optional[float] = None,
     height: Optional[float] = None,
-    chat_history: Optional[str] = None
+    chat_history: Optional[str] = None,
+    negatives: Optional[List[str]] = None,
+    modifiers: Optional[Any] = None,
+    red_flags: Optional[List[str]] = None,
 ) -> Tuple[float, Dict[str, Any]]:
     """
     Score how well a disease profile matches a patient case.
@@ -139,93 +406,147 @@ def score_disease_match(
     Returns:
         Tuple of (score: float, details: dict)
     """
-    score = 0.0
+    del weight, height, chat_history, modifiers  # retained for compatibility
+
+    positives = _dedupe_preserve(patient_symptoms if isinstance(patient_symptoms, list) else [])
+    negatives_norm = _dedupe_preserve(negatives if isinstance(negatives, list) else [])
+    red_flags_norm = _dedupe_preserve(red_flags if isinstance(red_flags, list) else [])
+
     details = {
         "symptom_matches": {"required": 0, "common": 0, "rare": 0},
-        "risk_factor_matches": 0,
+        "risk_factor_matches": 0.0,
         "urgency_match": False,
-        "match_reasons": []
+        "match_reasons": [],
+        "matched_positive_features": [],
+        "contradicted_features": [],
+        "exclude_hits": [],
+        "demographic_adjustments": [],
+        "raw_score": 0.0,
+        "final_numeric_score": 0.0,
     }
-    
-    # Normalize patient symptoms
-    patient_symptoms_lower = [s.lower().strip() for s in patient_symptoms]
-    
-    # Score symptom matches
-    required_symptoms = disease_profile["symptoms"]["required"]
-    common_symptoms = disease_profile["symptoms"]["common"]
-    rare_symptoms = disease_profile["symptoms"]["rare"]
-    
-    # Check required symptoms (high weight)
-    required_matches = sum(1 for s in required_symptoms if any(s in ps or ps in s for ps in patient_symptoms_lower))
-    details["symptom_matches"]["required"] = required_matches
-    if required_symptoms:
-        required_ratio = required_matches / len(required_symptoms)
-        score += required_ratio * 0.5  # Required symptoms are critical
-    
-    # Check common symptoms (medium weight)
-    common_matches = sum(1 for s in common_symptoms if any(s in ps or ps in s for ps in patient_symptoms_lower))
-    details["symptom_matches"]["common"] = common_matches
-    if common_symptoms:
-        common_ratio = common_matches / len(common_symptoms)
-        score += common_ratio * 0.3
-    
-    # Check rare symptoms (low weight)
-    rare_matches = sum(1 for s in rare_symptoms if any(s in ps or ps in s for ps in patient_symptoms_lower))
-    details["symptom_matches"]["rare"] = rare_matches
-    if rare_symptoms:
-        rare_ratio = rare_matches / len(rare_symptoms)
-        score += rare_ratio * 0.1
-    
-    # Score risk factors
-    risk_factors = disease_profile["risk_factors"]
-    risk_score = 0.0
-    
-    # Age matching
-    if age is not None and risk_factors.get("age_range"):
-        age_ranges = risk_factors["age_range"]
-        for age_range in age_ranges:
-            if isinstance(age_range, dict):
-                min_age = age_range.get("min", 0)
-                max_age = age_range.get("max", 150)
-                if min_age <= age <= max_age:
-                    risk_score += 0.15
-                    details["match_reasons"].append(f"Age {age} matches risk range")
-                    break
-            elif isinstance(age_range, list) and len(age_range) == 2:
-                if age_range[0] <= age <= age_range[1]:
-                    risk_score += 0.15
-                    details["match_reasons"].append(f"Age {age} matches risk range")
-                    break
-    
-    # Gender matching
-    if gender and risk_factors.get("gender"):
-        gender_lower = gender.lower()
-        if gender_lower in [g.lower() for g in risk_factors["gender"]]:
-            risk_score += 0.1
-            details["match_reasons"].append(f"Gender {gender} matches risk profile")
-    
-    # BMI matching disabled
-    
-    score += risk_score
-    details["risk_factor_matches"] = risk_score
-    
-    # Check urgency indicators
-    if disease_profile.get("urgency_indicators"):
-        urgency_matches = sum(1 for ind in disease_profile["urgency_indicators"] 
-                             if any(ind in ps or ps in ind for ps in patient_symptoms_lower))
-        if urgency_matches > 0:
-            details["urgency_match"] = True
-            score += 0.1
-    
-    # Adjust for prevalence (common diseases get slight boost)
-    if disease_profile.get("prevalence") == "common":
-        score *= 1.1
-    elif disease_profile.get("prevalence") == "rare":
-        score *= 0.9
-    
-    # Normalize score to 0-1 range
+
+    positive_score = 0.0
+    positive_max = 0.0
+    contradiction_penalty = 0.0
+    exclude_penalty = 0.0
+
+    feature_buckets = [
+        ("key", 1.25, 0.95),
+        ("supportive", 0.75, 0.55),
+        ("rare", 0.35, 0.2),
+    ]
+    for bucket_name, pos_factor, neg_factor in feature_buckets:
+        features = disease_profile.get("features", {}).get(bucket_name, [])
+        for feature in features:
+            term = _normalize_text(feature.get("term"))
+            if not term:
+                continue
+            try:
+                weight_value = float(feature.get("weight", 1.0))
+            except (TypeError, ValueError):
+                weight_value = 1.0
+            weighted_max = pos_factor * weight_value
+            positive_max += weighted_max
+            if _feature_match(term, positives):
+                positive_score += weighted_max
+                details["matched_positive_features"].append(term)
+            if _feature_match(term, negatives_norm):
+                contradiction_penalty += (neg_factor * weight_value)
+                details["contradicted_features"].append(term)
+
+    for feature in disease_profile.get("features", {}).get("exclude", []):
+        term = _normalize_text(feature.get("term"))
+        if not term:
+            continue
+        try:
+            weight_value = float(feature.get("weight", 1.0))
+        except (TypeError, ValueError):
+            weight_value = 1.0
+        if _feature_match(term, positives):
+            exclude_penalty += (1.35 * weight_value)
+            details["exclude_hits"].append(term)
+        elif _feature_match(term, negatives_norm):
+            positive_score += (0.12 * weight_value)
+            positive_max += (0.12 * weight_value)
+
+    required_symptoms = disease_profile.get("symptoms", {}).get("required", [])
+    common_symptoms = disease_profile.get("symptoms", {}).get("common", [])
+    rare_symptoms = disease_profile.get("symptoms", {}).get("rare", [])
+    details["symptom_matches"]["required"] = sum(1 for item in required_symptoms if _feature_match(item, positives))
+    details["symptom_matches"]["common"] = sum(1 for item in common_symptoms if _feature_match(item, positives))
+    details["symptom_matches"]["rare"] = sum(1 for item in rare_symptoms if _feature_match(item, positives))
+
+    positive_component = positive_score / max(1.0, positive_max)
+    penalty_component = (contradiction_penalty + exclude_penalty) / max(1.0, positive_max * 0.8)
+    penalty_component = min(1.4, penalty_component)
+
+    demographic_adjustment = 0.0
+    risk_factors = disease_profile.get("risk_factors", {})
+    age_ranges = risk_factors.get("age_ranges", []) if isinstance(risk_factors, dict) else []
+    if age is not None and age_ranges:
+        age_match = any(isinstance(item, tuple) and item[0] <= age <= item[1] for item in age_ranges)
+        if age_match:
+            demographic_adjustment += 0.18
+            details["demographic_adjustments"].append("age_match")
+        else:
+            demographic_adjustment -= 0.12
+            details["demographic_adjustments"].append("age_mismatch")
+
+    risk_genders = risk_factors.get("gender", []) if isinstance(risk_factors, dict) else []
+    gender_norm = _normalize_text(gender)
+    if gender_norm and risk_genders:
+        restricted = {g for g in risk_genders if g in {"male", "female", "man", "woman"}}
+        if len(restricted) == 1:
+            if gender_norm in restricted:
+                demographic_adjustment += 0.08
+                details["demographic_adjustments"].append("gender_match")
+            else:
+                demographic_adjustment -= 0.08
+                details["demographic_adjustments"].append("gender_mismatch")
+    details["risk_factor_matches"] = round(demographic_adjustment, 4)
+
+    tier_adjustment = 0.12 if disease_profile.get("is_core_tier") else -0.04
+    prevalence = disease_profile.get("prevalence", "")
+    if prevalence == "common":
+        tier_adjustment += 0.05
+    elif prevalence == "rare":
+        tier_adjustment -= 0.03
+
+    urgency_bonus = 0.0
+    urgency_indicators = disease_profile.get("urgency_indicators", [])
+    urgency_match = any(_feature_match(indicator, positives) for indicator in urgency_indicators)
+    if urgency_match:
+        urgency_bonus += 0.18
+    if disease_profile.get("is_emergency_candidate") and red_flags_norm:
+        urgency_bonus += 0.15
+    elif disease_profile.get("is_emergency_candidate") and not red_flags_norm:
+        urgency_bonus -= 0.02
+    details["urgency_match"] = urgency_match
+
+    raw_score = positive_component - penalty_component + demographic_adjustment + tier_adjustment + urgency_bonus
+    details["raw_score"] = round(raw_score, 4)
+
+    score = 1.0 / (1.0 + math.exp(-3.25 * (raw_score - 0.18)))
+    if not details["matched_positive_features"]:
+        score *= 0.35
+    if details["exclude_hits"] and len(details["matched_positive_features"]) < 2:
+        score *= 0.55
     score = min(1.0, max(0.0, score))
-    
+    details["final_numeric_score"] = round(score, 4)
+
+    if details["matched_positive_features"]:
+        details["match_reasons"].append(
+            "matched: " + ", ".join(details["matched_positive_features"][:5])
+        )
+    if details["contradicted_features"]:
+        details["match_reasons"].append(
+            "contradicted by negatives: " + ", ".join(details["contradicted_features"][:4])
+        )
+    if details["exclude_hits"]:
+        details["match_reasons"].append(
+            "exclude hits: " + ", ".join(details["exclude_hits"][:3])
+        )
+
     return score, details
 
 
@@ -235,7 +556,10 @@ def analyze_case(
     symptoms: List[str],
     chat_history: str = "",
     weight: Optional[float] = None,
-    height: Optional[float] = None
+    height: Optional[float] = None,
+    negatives: Optional[List[str]] = None,
+    modifiers: Optional[Any] = None,
+    red_flags: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Analyze a patient case using the disease registry and return top diagnoses.
@@ -252,20 +576,17 @@ def analyze_case(
         Dictionary with conditions and follow-up questions in the expected format
     """
     global DISEASE_PROFILES
-    
+    del chat_history  # structured-state workflow: no raw chat scoring
+
     if not DISEASE_PROFILES:
         logger.warning("No disease profiles loaded. Call build_disease_profiles() first.")
         return {
             "conditions": [],
-            "follow_up_questions": [
-                "How long have you had these symptoms?",
-                "Have you taken any medication?",
-                "Any other symptoms you've noticed?"
-            ]
+            "follow_up_questions": []
         }
     
     # Score all diseases
-    scored_diseases = []
+    scored_diseases: List[Dict[str, Any]] = []
     for profile in DISEASE_PROFILES:
         score, details = score_disease_match(
             profile,
@@ -274,10 +595,13 @@ def analyze_case(
             gender=gender,
             weight=weight,
             height=height,
-            chat_history=chat_history
+            chat_history=None,
+            negatives=negatives,
+            modifiers=modifiers,
+            red_flags=red_flags,
         )
         
-        if score > 0:  # Only include diseases with some match
+        if score > 0:
             scored_diseases.append({
                 "profile": profile,
                 "score": score,
@@ -287,8 +611,8 @@ def analyze_case(
     # Sort by score (highest first)
     scored_diseases.sort(key=lambda x: x["score"], reverse=True)
     
-    # Get top 3
-    top_diseases = scored_diseases[:3]
+    # Keep a wider shortlist for trace/reports; API still returns top 3 conditions.
+    top_diseases = scored_diseases[:5]
     
     # Build response in expected format
     conditions = []
@@ -297,41 +621,47 @@ def analyze_case(
         score = disease_data["score"]
         details = disease_data["details"]
         
-        # Determine probability level
-        if score >= 0.7:
+        if score >= 0.72:
             probability = "High"
-        elif score >= 0.5:
+        elif score >= 0.48:
             probability = "Moderate"
         else:
             probability = "Low"
         
-        # Determine urgency
         urgency = "Monitor"
-        if details.get("urgency_match"):
+        if details.get("urgency_match") or (profile.get("is_emergency_candidate") and red_flags):
             urgency = "Emergency"
-        elif score >= 0.6:
+        elif probability in {"High", "Moderate"}:
             urgency = "Routine"
         
-        # Build reasoning
-        reasoning_parts = []
-        if details["symptom_matches"]["required"] > 0:
-            reasoning_parts.append(f"Matches {details['symptom_matches']['required']} required symptom(s)")
-        if details["symptom_matches"]["common"] > 0:
-            reasoning_parts.append(f"Matches {details['symptom_matches']['common']} common symptom(s)")
-        if details["risk_factor_matches"] > 0:
-            reasoning_parts.append("Patient demographics match risk profile")
-        
-        reasoning = ". ".join(reasoning_parts) if reasoning_parts else "Possible differential based on symptom pattern."
+        reasoning_parts: List[str] = []
+        matched = details.get("matched_positive_features", [])
+        contrad = details.get("contradicted_features", [])
+        if matched:
+            reasoning_parts.append("Matches " + ", ".join(matched[:3]))
+        if contrad:
+            reasoning_parts.append("Conflicts with negatives: " + ", ".join(contrad[:2]))
+        if details.get("exclude_hits"):
+            reasoning_parts.append("Exclude-feature conflict present")
+        reasoning = ". ".join(reasoning_parts) if reasoning_parts else "Limited but possible pattern match."
         
         conditions.append({
             "name": profile["name"],
             "probability": probability,
             "reasoning": reasoning,
-            "urgency": urgency
+            "urgency": urgency,
+            "score": round(score, 4),
+            "disease_id": profile.get("id"),
+            "score_details": {
+                "matched_positive_features": details.get("matched_positive_features", []),
+                "contradicted_features": details.get("contradicted_features", []),
+                "exclude_hits": details.get("exclude_hits", []),
+                "demographic_adjustments": details.get("demographic_adjustments", []),
+                "final_numeric_score": details.get("final_numeric_score", round(score, 4)),
+            },
         })
     
-    # Generate follow-up questions
-    follow_up_questions = build_followup_questions(top_diseases, symptoms, chat_history)
+    follow_up_questions = build_followup_questions(top_diseases, symptoms, "")
     
     return {
         "conditions": conditions,
@@ -355,57 +685,37 @@ def build_followup_questions(
     Returns:
         List of follow-up questions
     """
-    questions = []
-    
-    # Generic questions if no specific matches
+    del chat_history
+    questions: List[str] = []
+
     if not top_diseases:
-        return [
-            "How long have you had these symptoms?",
-            "Have you taken any medication?",
-            "Any other symptoms you've noticed?"
-        ]
-    
-    # Build questions based on top disease
+        return []
+
     top_disease = top_diseases[0]
     profile = top_disease["profile"]
-    
-    # Check for missing required symptoms
-    required_symptoms = profile["symptoms"]["required"]
-    patient_symptoms_lower = [s.lower().strip() for s in symptoms]
-    
-    missing_required = []
-    for req_symptom in required_symptoms:
-        if not any(req_symptom in ps or ps in req_symptom for ps in patient_symptoms_lower):
-            missing_required.append(req_symptom)
-    
-    if missing_required:
-        questions.append(f"Have you experienced {missing_required[0]}?")
-    
-    # Add temporal questions
-    if "How long" not in chat_history and "duration" not in chat_history.lower():
-        questions.append("How long have you been experiencing these symptoms?")
-    
-    # Add severity questions
-    if not any(word in chat_history.lower() for word in ["severe", "mild", "moderate", "pain level"]):
-        questions.append("On a scale of 1-10, how would you rate the severity of your symptoms?")
-    
-    # Add context-specific questions based on organ system
-    organ_system = profile.get("organ_system", "").lower()
-    if "gastrointestinal" in organ_system or "hepatobiliary" in organ_system:
-        if not any(word in chat_history.lower() for word in ["appetite", "eating", "diet"]):
-            questions.append("Have you noticed any changes in your appetite or eating habits?")
-    elif "respiratory" in organ_system:
-        if not any(word in chat_history.lower() for word in ["cough", "breathing", "shortness"]):
-            questions.append("Have you experienced any difficulty breathing or coughing?")
-    elif "cardiovascular" in organ_system:
-        if not any(word in chat_history.lower() for word in ["chest", "heart", "palpitation"]):
-            questions.append("Have you experienced any chest discomfort or heart-related symptoms?")
-    
-    # Ensure we have at least 3 questions
-    while len(questions) < 3:
-        questions.append("Any other symptoms or concerns you'd like to mention?")
-    
-    return questions[:3]  # Return top 3
+
+    second_profile = {}
+    if len(top_diseases) > 1 and isinstance(top_diseases[1], dict):
+        second_profile = top_diseases[1].get("profile", {}) or {}
+
+    known = _dedupe_preserve(symptoms if isinstance(symptoms, list) else [])
+    top_key = [f.get("term", "") for f in profile.get("features", {}).get("key", [])]
+    second_key = [f.get("term", "") for f in second_profile.get("features", {}).get("key", [])]
+    unique_terms = [term for term in top_key if term and term not in second_key and term not in known]
+
+    if unique_terms:
+        questions.append(f"Are you currently experiencing {unique_terms[0]}?")
+    if len(unique_terms) > 1:
+        questions.append(f"Is {unique_terms[1]} present along with your main symptoms?")
+
+    if not questions:
+        required_symptoms = profile.get("symptoms", {}).get("required", [])
+        for req_symptom in required_symptoms:
+            if req_symptom and req_symptom not in known:
+                questions.append(f"Have you experienced {req_symptom}?")
+                break
+
+    return questions[:3]
 
 
 def build_json_prompt(
@@ -500,4 +810,3 @@ def build_json_prompt(
     """
     
     return prompt
-

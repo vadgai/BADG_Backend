@@ -19,7 +19,7 @@ class LoggedModelWrapper:
     Wrapper around Gemini model that automatically logs all calls.
     """
     
-    def __init__(self, model_name: str = "gemini-2.5-flash"):
+    def __init__(self, model_name: str = "gemini-3.1-flash-lite-preview"):
         self.model_name = model_name
         self._model = None
         self._model_available = False
@@ -127,7 +127,7 @@ class LoggedModelWrapper:
 _logged_model_wrapper: Optional[LoggedModelWrapper] = None
 
 
-def get_logged_model(model_name: str = "gemini-2.5-flash") -> LoggedModelWrapper:
+def get_logged_model(model_name: str = "gemini-3.1-flash-lite-preview") -> LoggedModelWrapper:
     """
     Get a logged model wrapper instance.
     
@@ -149,7 +149,7 @@ async def generate_content_with_logging(
     prompt: str,
     session_id: Optional[str] = None,
     endpoint: Optional[str] = None,
-    model_name: str = "gemini-2.5-flash",
+    model_name: str = "gemini-3.1-flash-lite-preview",
     generation_config: Optional[Dict[str, Any]] = None,
     metadata: Optional[Dict[str, Any]] = None
 ):

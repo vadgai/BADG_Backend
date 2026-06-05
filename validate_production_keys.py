@@ -69,7 +69,7 @@ def test_key(key: str, key_name: str) -> bool:
     try:
         import google.generativeai as genai
         genai.configure(api_key=key)
-        model = genai.GenerativeModel("gemini-2.5-flash")
+        model = genai.GenerativeModel("gemini-3.1-flash-lite-preview")
         response = model.generate_content("Say 'API key works'")
         if response and response.text:
             print(f"✅ {key_name}: Key is valid and working")

@@ -114,16 +114,17 @@ Diagnosis Ready:
 
 ### 4. Generate Report
 
-Generates and returns a PDF diagnosis report.
+Generates a structured diagnosis report as JSON. The frontend renders and downloads the PDF client-side.
 
 **Endpoint:** `GET /generate_report/{session_id}`
 
 **Parameters:**
 - `session_id`: The UUID of the patient session
+- `lang` (optional): Target language code (`en`, `hi`, `ta`, `te`, `bn`, `kn`)
 
 **Response:**
-- A PDF file containing the medical diagnosis report
-- Content-Type: application/pdf
+- JSON object with patient info, clinical summary, conditions, recommendations, etc.
+- The React app uses this payload to generate a downloadable PDF in the browser.
 
 ## Integration Example (JavaScript)
 

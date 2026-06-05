@@ -2,9 +2,9 @@
 Clinical Follow-Up Question Generator v3.0
 ===========================================
 
-MAJOR CHANGE: Enforces 7-10 questions per session (not 1 question at a time).
+MAJOR CHANGE: Enforces 6-8 questions per session (not 1 question at a time).
 
-This version generates 7-10 follow-up questions in a single API call to ensure:
+This version generates 6-8 follow-up questions in a single API call to ensure:
 - Comprehensive clinical screening
 - No generic/template questions
 - Strict differential diagnosis approach
@@ -17,6 +17,7 @@ Version: 3.0
 
 import os
 import json
+import math
 import logging
 from typing import Dict, List, Union, Optional
 from dotenv import load_dotenv
@@ -41,13 +42,76 @@ if model_available:
     logger.info("="*80)
     logger.info(f"✅ Clinical Follow-up Engine v3.0 initialized with Gemini API")
     logger.info(f"   Model: {MODEL_NAME}")
-    logger.info(f"   Mode: 7-10 questions per session")
+    logger.info(f"   Mode: 6-8 questions per session")
     logger.info("="*80)
 else:
     logger.warning("="*80)
     logger.warning("⚠️ Gemini model not available for follow-up engine v3.0")
     logger.warning("   Fallback mode will be used")
     logger.warning("="*80)
+
+def _extract_last_answer_v3(chat_history: Union[str, List, None]) -> str:
+    """Extract latest user answer from chat history for better prompt grounding."""
+    if not chat_history:
+        return "None"
+    if isinstance(chat_history, str):
+        try:
+            chat_history = json.loads(chat_history)
+        except Exception:
+            return "None"
+    if isinstance(chat_history, list):
+        for msg in reversed(chat_history):
+            if isinstance(msg, dict) and msg.get("user"):
+                return str(msg.get("user")).strip() or "None"
+    return "None"
+
+
+def _format_history_v3(chat_history: Union[str, List, None]) -> str:
+    """Compact Q/A formatter to keep prompts concise and useful."""
+    if not chat_history:
+        return "No previous questions asked"
+    if isinstance(chat_history, str):
+        return chat_history.strip() or "No previous questions asked"
+    if isinstance(chat_history, list):
+        lines = []
+        q_idx = 0
+        for i, msg in enumerate(chat_history):
+            if not isinstance(msg, dict):
+                continue
+            q = msg.get("bot") or msg.get("Question")
+            if q:
+                q_idx += 1
+                lines.append(f"Q{q_idx}: {str(q).strip()}")
+                if i + 1 < len(chat_history):
+                    nxt = chat_history[i + 1]
+                    if isinstance(nxt, dict) and nxt.get("user"):
+                        lines.append(f"A{q_idx}: {str(nxt.get('user')).strip()}")
+        return "\n".join(lines) if lines else "No previous questions asked"
+    return "No previous questions asked"
+
+
+def _build_bmi_signal(weight: Optional[Union[int, float, str]], height: Optional[Union[int, float, str]]) -> str:
+    """Safe BMI signal text for v3 prompts."""
+    try:
+        if weight is None or height is None:
+            return "BMI not available"
+        w = float(weight)
+        h = float(height)
+        if not math.isfinite(w) or not math.isfinite(h) or w <= 0 or h <= 0:
+            return "BMI not available"
+        if 0.5 <= h <= 2.5:
+            h *= 100.0
+        elif 36 <= h <= 96:
+            h *= 2.54
+        if not (20 <= w <= 400 and 90 <= h <= 250):
+            return "BMI not available"
+        bmi = w / ((h / 100.0) ** 2)
+        if not math.isfinite(bmi) or bmi <= 0 or bmi > 80:
+            return "BMI not available"
+        bmi_cat = "Underweight" if bmi < 18.5 else "Normal" if bmi < 25 else "Overweight" if bmi < 30 else "Obese"
+        return f"BMI: {bmi:.1f} ({bmi_cat})"
+    except Exception:
+        return "BMI not available"
 
 
 def _build_clinical_prompt_v3(
@@ -63,13 +127,12 @@ def _build_clinical_prompt_v3(
     diet_type: str = None,
 ) -> str:
     """
-    Build v3 prompt that ENFORCES 7-10 questions with strict clinical reasoning.
-    
-    This prompt is designed to prevent generic questions and enforce
-    differential diagnosis-driven questioning.
+    Build v3 prompt that ENFORCES 6-8 questions with strict clinical reasoning.
     """
     
     symptoms_str = ", ".join(symptoms) if isinstance(symptoms, list) else str(symptoms)
+    latest_answer = _extract_last_answer_v3(chat_history)
+    history_text = _format_history_v3(chat_history)
     
     # Build patient context
     patient_context = f"{age}-year-old {gender.lower()}"
@@ -77,189 +140,47 @@ def _build_clinical_prompt_v3(
     # Build patient profile
     profile_details = []
     
-    if weight and height:
-        try:
-            bmi = float(weight) / ((float(height) / 100) ** 2)
-            if bmi > 0:
-                bmi_cat = "Underweight" if bmi < 18.5 else "Normal" if bmi < 25 else "Overweight" if bmi < 30 else "Obese"
-                profile_details.append(f"BMI: {bmi:.1f} ({bmi_cat})")
-        except:
-            pass
+    profile_details.append(_build_bmi_signal(weight, height))
     
-    if occupation:
-        profile_details.append(f"Occupation: {occupation}")
-    if physical_activity:
-        profile_details.append(f"Physical Activity: {physical_activity}")
-    if diet_type:
-        profile_details.append(f"Diet: {diet_type}")
-    if location and isinstance(location, dict):
-        loc_parts = [location.get("city"), location.get("state"), location.get("country")]
-        loc_str = ", ".join([p for p in loc_parts if p])
-        if loc_str:
-            profile_details.append(f"Location: {loc_str}")
+    profile_section = "\n".join([f"- {d}" for d in profile_details]) if profile_details else "- BMI not available"
     
-    profile_section = "\n".join([f"- {d}" for d in profile_details]) if profile_details else "- Limited demographic data"
-    
-    prompt = f"""You are a clinical reasoning engine for medical professionals, NOT a chatbot.
+    prompt = f"""You are a clinical reasoning engine. Language: English only.
+Generate 6-8 high-value follow-up questions.
+Goal: identify the top 2 most likely diseases with minimal questions.
 
-═══════════════════════════════════════════════════════════════════════════════
-TASK
-═══════════════════════════════════════════════════════════════════════════════
-Generate 7–10 highly relevant follow-up questions based ONLY on the given patient symptoms.
-
-═══════════════════════════════════════════════════════════════════════════════
-PATIENT INFORMATION
-═══════════════════════════════════════════════════════════════════════════════
-Demographics: {patient_context}
+Patient: {patient_context}
 {profile_section}
+Symptoms: {symptoms_str}
+Latest patient answer: {latest_answer}
+History:
+{history_text}
 
-Presenting Symptoms: {symptoms_str}
+Rules:
+- 6-8 questions only.
+- Use symptoms from patient form + latest patient answer + full chat history.
+- Use BMI category as a supporting signal when available.
+- If BMI is unavailable, continue with symptom/history evidence only.
+- Each question must reduce uncertainty between the top 2 likely diseases.
+- Do NOT repeat or paraphrase any question already asked in history.
+- Red-flag questions first if relevant.
+- Patient-friendly, short, one concept per question.
 
-Conversation History:
-{chat_history if chat_history else "No previous questions asked - this is the initial assessment"}
-
-═══════════════════════════════════════════════════════════════════════════════
-ABSOLUTE RULES (NON-NEGOTIABLE)
-═══════════════════════════════════════════════════════════════════════════════
-
-1. You MUST generate BETWEEN 7 AND 10 questions in EVERY case.
-   - Not 1 question. Not 5 questions. Between 7 and 10.
-   - This is NON-NEGOTIABLE.
-
-2. You are STRICTLY FORBIDDEN from using default or generic questions such as:
-   - "Do you have any other symptoms?"
-   - "How long have you been feeling this?"
-   - "Any past medical history?"
-   - "How are you feeling?"
-   - "Is there anything else bothering you?"
-   
-3. Each question MUST be clinically meaningful and reduce diagnostic uncertainty.
-   - Every question should help differentiate between specific conditions.
-   - Questions should target missing clinical information.
-
-4. Questions must be DIFFERENTIAL-DRIVEN, not symptom-collection driven.
-   - Start by identifying 2-3 most likely diagnoses.
-   - Ask questions that differentiate between them.
-
-5. If red-flag symptoms are suspected, PRIORITIZE those questions first.
-   - Life-threatening conditions take priority.
-   - Urgent indicators come before routine questions.
-
-6. You MUST NOT output diagnosis, explanations, or advice.
-   - Output ONLY the JSON structure.
-   - No commentary outside the JSON.
-
-7. You MUST NOT return an empty list under ANY condition.
-   - Even if symptoms are vague, generate questions.
-   - Even if diagnosis seems obvious, generate questions.
-
-═══════════════════════════════════════════════════════════════════════════════
-REASONING STRATEGY (INTERNAL – DO NOT OUTPUT THIS)
-═══════════════════════════════════════════════════════════════════════════════
-
-Step 1: DIFFERENTIAL DIAGNOSIS
-- Analyze all symptoms as a constellation
-- Consider patient demographics (age, gender, location)
-- Identify the top 2–3 most likely conditions
-
-Step 2: GAP ANALYSIS
-- What clinical information is MISSING?
-- What features would differentiate between your top diagnoses?
-- Prioritize:
-  1. RED FLAGS (life-threatening signs)
-  2. PATHOGNOMONIC features (disease-specific symptoms)
-  3. TEMPORAL patterns (onset, duration, progression)
-  4. SEVERITY indicators (functional impact)
-  5. ASSOCIATED symptoms
-  6. RISK FACTORS and exposures
-
-Step 3: QUESTION GENERATION
-- Generate 7-10 questions that address the gaps identified above
-- Order by priority (red flags first)
-- Ensure each question reduces diagnostic uncertainty
-
-═══════════════════════════════════════════════════════════════════════════════
-OUTPUT FORMAT (STRICT JSON ONLY)
-═══════════════════════════════════════════════════════════════════════════════
-
+Return JSON only:
 {{
   "follow_up_questions": [
     {{
       "id": 1,
-      "question": "Specific, targeted clinical question in patient-friendly language",
+      "question": "Short, targeted question",
       "priority": "red-flag | high | medium",
-      "clinical_focus": "What this question is trying to confirm or rule out",
+      "clinical_focus": "What this clarifies",
       "differentiates_between": ["Disease A", "Disease B"]
-    }},
-    {{
-      "id": 2,
-      "question": "Second question...",
-      "priority": "high | medium",
-      "clinical_focus": "...",
-      "differentiates_between": ["...", "..."]
     }}
-    // ... continue for 7-10 questions total
   ],
-  "question_count": 7-10,
-  "top_differentials": ["Disease 1", "Disease 2", "Disease 3"],
+  "question_count": <number>,
+  "top_differentials": ["Disease 1", "Disease 2"],
   "confidence_level": "low | medium | high",
-  "reasoning_summary": "One sentence explaining your differential diagnosis approach"
+  "reasoning_summary": "One short sentence"
 }}
-
-CRITICAL REQUIREMENTS:
-- The "follow_up_questions" array MUST contain 7-10 items
-- Each question MUST have all required fields (id, question, priority, clinical_focus, differentiates_between)
-- Questions MUST be ordered by priority (red-flag first, then high, then medium)
-- The "question_count" field MUST match the actual number of questions
-- The "top_differentials" array MUST list 2-3 specific disease names
-
-═══════════════════════════════════════════════════════════════════════════════
-FAILSAFE ENFORCEMENT
-═══════════════════════════════════════════════════════════════════════════════
-
-- If you are unsure, STILL generate 7–10 questions.
-- If symptoms are minimal (e.g., just "fever"), generate broad screening questions:
-  * Respiratory symptoms (cough, sputum, dyspnea)
-  * GI symptoms (nausea, vomiting, diarrhea)
-  * Neurological symptoms (headache, confusion, stiff neck)
-  * Urinary symptoms (dysuria, frequency, hematuria)
-  * Severity and functional impact
-  * Temporal patterns
-  * Red flag screening
-
-- If symptoms are clear (e.g., "crushing chest pain"), generate targeted questions:
-  * All relevant red flags for suspected condition
-  * Differentiating features from similar conditions
-  * Severity assessment
-  * Contraindications to treatment
-  * Risk factors
-  * Associated symptoms
-
-- NEVER reuse default or template questions.
-- NEVER ask questions already answered in chat history.
-
-═══════════════════════════════════════════════════════════════════════════════
-EXAMPLES OF GOOD QUESTIONS (for reference only)
-═══════════════════════════════════════════════════════════════════════════════
-
-For "headache":
-✓ "Do you have a stiff neck, fever, or sensitivity to light?" (RED FLAG - meningitis)
-✓ "Is the pain throbbing and on one side of your head?" (PATHOGNOMONIC - migraine)
-✓ "Does the pain worsen with physical activity or movement?" (DISCRIMINATING)
-✓ "Do you see flashing lights or zigzag lines before the pain?" (AURA - migraine)
-
-For "chest pain":
-✓ "Does the pain radiate to your left arm, jaw, or back?" (RED FLAG - MI)
-✓ "Is the pain crushing or squeezing in nature?" (CHARACTERISTIC - MI)
-✓ "Does the pain worsen with deep breathing or movement?" (DISCRIMINATING - pleuritic vs cardiac)
-✓ "Are you sweating or feeling nauseous?" (ASSOCIATED - MI)
-
-═══════════════════════════════════════════════════════════════════════════════
-BEGIN
-═══════════════════════════════════════════════════════════════════════════════
-
-Output ONLY valid JSON. No markdown, no explanations, no commentary.
-Start your response with {{ and end with }}.
 """
     
     return prompt
@@ -302,7 +223,7 @@ def _parse_json_response_v3(response_text: str) -> Optional[Dict]:
 
 def _validate_v3_response(data: Dict) -> bool:
     """
-    Validate that response meets v3 requirements (7-10 questions).
+    Validate that response meets v3 requirements (6-8 questions).
     """
     if not isinstance(data, dict):
         return False
@@ -313,9 +234,9 @@ def _validate_v3_response(data: Dict) -> bool:
     
     questions = data["follow_up_questions"]
     
-    # Must have 7-10 questions
-    if not isinstance(questions, list) or not (7 <= len(questions) <= 10):
-        logger.warning(f"Invalid question count: {len(questions) if isinstance(questions, list) else 0} (need 7-10)")
+    # Must have 6-8 questions
+    if not isinstance(questions, list) or not (6 <= len(questions) <= 8):
+        logger.warning(f"Invalid question count: {len(questions) if isinstance(questions, list) else 0} (need 6-8)")
         return False
     
     # Each question must have required fields
@@ -333,7 +254,7 @@ def _generate_fallback_questions_v3(
     gender: str
 ) -> Dict:
     """
-    Generate 7-10 fallback questions when API fails.
+    Generate 6-8 fallback questions when API fails.
     These are high-quality clinical questions based on symptom patterns.
     """
     
@@ -458,8 +379,30 @@ def _generate_fallback_questions_v3(
         }
     ])
     
-    # Ensure exactly 7-10 questions
-    questions = questions[:10]  # Cap at 10
+    # Ensure 6-8 questions
+    questions = questions[:8]  # Cap at 8
+    if len(questions) < 6:
+        # Add simple, high-value screening questions if needed
+        padding = [
+            {
+                "id": len(questions) + 1,
+                "question": "Are you feeling unusually tired or weak?",
+                "priority": "medium",
+                "clinical_focus": "Assess systemic impact",
+                "differentiates_between": ["Systemic illness", "Localized condition"]
+            },
+            {
+                "id": len(questions) + 1,
+                "question": "Have your symptoms stayed the same, worsened, or improved?",
+                "priority": "medium",
+                "clinical_focus": "Assess progression",
+                "differentiates_between": ["Progressive condition", "Stable condition"]
+            }
+        ]
+        for item in padding:
+            if len(questions) >= 6:
+                break
+            questions.append(item)
     
     # Renumber to ensure sequential IDs
     for idx, q in enumerate(questions, 1):
@@ -468,7 +411,7 @@ def _generate_fallback_questions_v3(
     return {
         "follow_up_questions": questions,
         "question_count": len(questions),
-        "top_differentials": ["Infectious disease", "Inflammatory condition", "Acute illness"],
+        "top_differentials": ["Infectious disease", "Inflammatory condition"],
         "confidence_level": "low",
         "reasoning_summary": "Fallback questions generated due to API unavailability"
     }
@@ -487,10 +430,10 @@ def get_followup_for_diagnosis_v3(
     diet_type: str = None,
 ) -> Dict:
     """
-    Generate 7-10 follow-up questions using v3 clinical reasoning engine.
+    Generate 6-8 follow-up questions using v3 clinical reasoning engine.
     
     Returns:
-        Dict with follow_up_questions array (7-10 questions)
+        Dict with follow_up_questions array (6-8 questions)
         NEVER returns None or empty array
     """
     
@@ -522,7 +465,7 @@ def get_followup_for_diagnosis_v3(
         success, response, error = generate_content_with_fallback(
             prompt=prompt,
             temperature=0.3,
-            max_output_tokens=3000  # Need more tokens for 7-10 questions
+            max_output_tokens=1600  # Reduced tokens for 6-8 questions
         )
         
         if success and response:
@@ -570,5 +513,5 @@ if __name__ == "__main__":
     print(json.dumps(test_result, indent=2))
     print("\nValidation:")
     print(f"Question count: {len(test_result['follow_up_questions'])}")
-    print(f"Expected: 7-10")
-    print(f"Status: {'✅ PASS' if 7 <= len(test_result['follow_up_questions']) <= 10 else '❌ FAIL'}")
+    print(f"Expected: 6-8")
+    print(f"Status: {'✅ PASS' if 6 <= len(test_result['follow_up_questions']) <= 8 else '❌ FAIL'}")

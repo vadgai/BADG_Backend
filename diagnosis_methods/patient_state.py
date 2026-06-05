@@ -7,13 +7,63 @@ full chat history in the hybrid diagnosis approach.
 
 import json
 import logging
+"""
+Patient State Management for Method 2 (Hybrid State-Based Diagnosis)
+
+This module manages the structured patient state JSON that replaces
+full chat history in the hybrid diagnosis approach.
+"""
+
+import json
+import logging
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 
-def initialize_patient_state(age: int, gender: str, symptoms: List[str]) -> Dict[str, Any]:
+def _calculate_bmi(weight: Optional[float], height: Optional[float], gender: str) -> Dict[str, Any]:
+    """
+    Calculate BMI with fallbacks to Indian population averages if data is missing.
+    Male: 170cm, 70kg | Female: 156cm, 60kg
+    """
+    # Fallbacks based on Indian population averages (ICMR/NIN)
+    default_h = 170.0 if gender.lower() == "male" else 156.0
+    default_w = 70.0 if gender.lower() == "male" else 60.0
+
+    h = float(height) if height and float(height) > 0 else default_h
+    w = float(weight) if weight and float(weight) > 0 else default_w
+
+    # Handle height in meters (e.g. 1.7) vs cm (e.g. 170)
+    if 0.5 <= h <= 2.5:
+        h *= 100.0
+    
+    bmi = w / ((h / 100) ** 2)
+    
+    category = "Normal"
+    if bmi < 18.5:
+        category = "Underweight"
+    elif bmi >= 30:
+        category = "Obese"
+    elif bmi >= 25:
+        category = "Overweight"
+    
+    return {
+        "value": round(bmi, 1),
+        "category": category,
+        "height_cm": round(h, 1),
+        "weight_kg": round(w, 1),
+        "is_estimated": not (weight and height)
+    }
+
+
+def initialize_patient_state(
+    age: int, 
+    gender: str, 
+    symptoms: List[str],
+    weight: Optional[float] = None,
+    height: Optional[float] = None
+) -> Dict[str, Any]:
     """
     Initialize a new patient state JSON structure.
     
@@ -21,6 +71,8 @@ def initialize_patient_state(age: int, gender: str, symptoms: List[str]) -> Dict
         age: Patient age
         gender: Patient gender
         symptoms: Initial symptoms list
+        weight: Patient weight in kg
+        height: Patient height in cm or meters
         
     Returns:
         Initialized patient state dictionary
@@ -28,7 +80,10 @@ def initialize_patient_state(age: int, gender: str, symptoms: List[str]) -> Dict
     return {
         "demographics": {
             "age": age,
-            "gender": gender.lower()
+            "gender": gender.lower(),
+            "weight": weight,
+            "height": height,
+            "bmi": _calculate_bmi(weight, height, gender)
         },
         "chief_complaint": ", ".join(symptoms) if isinstance(symptoms, list) else str(symptoms),
         "identified_symptoms": symptoms if isinstance(symptoms, list) else [str(symptoms)],
@@ -37,6 +92,30 @@ def initialize_patient_state(age: int, gender: str, symptoms: List[str]) -> Dict
         "differential_diagnosis": [],  # List of {name, confidence, reasoning} - Top 3 suspects ranked by likelihood
         "differentiator_symptom": "",  # The symptom that differentiates Suspect #1 from Suspect #2
         "running_summary": "",  # Pre-calculated summary for fast report generation
+        "red_flags": [],  # Critical danger signs extracted during follow-up
+        "symptom_state": {
+            "current_symptoms": symptoms if isinstance(symptoms, list) else [str(symptoms)],
+            "modifiers": [],
+            "modifier_map": {
+                "duration": "",
+                "onset": "",
+                "location": "",
+                "quality": "",
+                "severity": "",
+                "aggravating_factors": [],
+                "relieving_factors": [],
+                "associated_symptoms": [],
+            },
+            "red_flags": [],
+            "questions_asked": [],
+        },
+        "diagnostic_trace": [],
+        "diagnostic_counters": {
+            "repeated_question_prevention_hits": 0,
+            "generic_question_rejection_hits": 0,
+            "deterministic_fallback_frequency": 0,
+            "out_of_pool_llm_suggestion_rejections": 0,
+        },
         "confidence_score": 0.0,
         "turn_count": 0,
         "created_at": datetime.utcnow().isoformat(),
@@ -65,6 +144,11 @@ def update_patient_state(
     # Increment turn count
     state["turn_count"] = state.get("turn_count", 0) + 1
     state["last_updated"] = datetime.utcnow().isoformat()
+    
+    # Track conversation history for LLM context
+    history = state.setdefault("chat_history", [])
+    if question or answer:
+        history.append({"bot": question, "user": answer})
     
     # If AI analysis is provided, use it to update state
     if ai_analysis:
@@ -129,10 +213,73 @@ def update_patient_state(
             summary = ai_analysis.get("running_summary", "")
             if summary:
                 state["running_summary"] = summary
+
+        if "modifier_map" in ai_analysis and isinstance(ai_analysis.get("modifier_map"), dict):
+            symptom_state_local = state.get("symptom_state") if isinstance(state.get("symptom_state"), dict) else {}
+            existing_map = symptom_state_local.get("modifier_map") if isinstance(symptom_state_local.get("modifier_map"), dict) else {}
+            merged_map = dict(existing_map)
+            for key, value in ai_analysis.get("modifier_map", {}).items():
+                if isinstance(value, list):
+                    prev = merged_map.get(key, [])
+                    if not isinstance(prev, list):
+                        prev = []
+                    merged_map[key] = list(dict.fromkeys([*prev, *value]))
+                elif str(value).strip():
+                    merged_map[key] = value
+            symptom_state_local["modifier_map"] = merged_map
+            state["symptom_state"] = symptom_state_local
         
         # Update confidence score
         if "confidence_score" in ai_analysis:
             state["confidence_score"] = ai_analysis.get("confidence_score", state.get("confidence_score", 0.0))
+
+    # Keep structured symptom_state synchronized for token-efficient prompting.
+    symptom_state = state.get("symptom_state")
+    if not isinstance(symptom_state, dict):
+        symptom_state = {
+            "current_symptoms": [],
+            "modifiers": [],
+            "modifier_map": {
+                "duration": "",
+                "onset": "",
+                "location": "",
+                "quality": "",
+                "severity": "",
+                "aggravating_factors": [],
+                "relieving_factors": [],
+                "associated_symptoms": [],
+            },
+            "red_flags": [],
+            "questions_asked": [],
+        }
+    symptom_state["current_symptoms"] = list(state.get("identified_symptoms", []))
+    symptom_state["red_flags"] = list(state.get("red_flags", []))
+    symptom_state.setdefault("modifiers", [])
+    symptom_state.setdefault(
+        "modifier_map",
+        {
+            "duration": "",
+            "onset": "",
+            "location": "",
+            "quality": "",
+            "severity": "",
+            "aggravating_factors": [],
+            "relieving_factors": [],
+            "associated_symptoms": [],
+        },
+    )
+    symptom_state.setdefault("questions_asked", [])
+    state["symptom_state"] = symptom_state
+    state.setdefault("diagnostic_trace", [])
+    state.setdefault(
+        "diagnostic_counters",
+        {
+            "repeated_question_prevention_hits": 0,
+            "generic_question_rejection_hits": 0,
+            "deterministic_fallback_frequency": 0,
+            "out_of_pool_llm_suggestion_rejections": 0,
+        },
+    )
     
     return state
 
@@ -151,11 +298,31 @@ def state_to_prompt_string(state: Dict[str, Any]) -> str:
     lines.append("PATIENT STATE:")
     lines.append(f"Age: {state['demographics']['age']} years")
     lines.append(f"Gender: {state['demographics']['gender']}")
+    
+    bmi_data = state['demographics'].get('bmi', {})
+    if bmi_data:
+        lines.append(f"BMI: {bmi_data.get('value')} ({bmi_data.get('category')})")
+        if bmi_data.get('is_estimated'):
+            lines.append("  (Note: BMI estimated using Indian population averages)")
+            
     lines.append(f"Chief Complaint: {state.get('chief_complaint', 'N/A')}")
+
     lines.append("")
     lines.append("Identified Symptoms:")
     for symptom in state.get("identified_symptoms", []):
         lines.append(f"  - {symptom}")
+
+    symptom_state = state.get("symptom_state") if isinstance(state.get("symptom_state"), dict) else {}
+    modifier_map = symptom_state.get("modifier_map") if isinstance(symptom_state.get("modifier_map"), dict) else {}
+    if modifier_map:
+        lines.append("")
+        lines.append("Modifier Map:")
+        for key, value in modifier_map.items():
+            if isinstance(value, list):
+                if value:
+                    lines.append(f"  - {key}: {', '.join(str(v) for v in value)}")
+            elif str(value).strip():
+                lines.append(f"  - {key}: {value}")
     
     if state.get("negatives"):
         lines.append("")

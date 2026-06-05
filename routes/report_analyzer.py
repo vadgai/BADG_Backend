@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import tempfile
+import uuid
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from pathlib import Path
@@ -19,6 +20,20 @@ from dotenv import load_dotenv
 
 # Import centralized Gemini API manager
 from utils.gemini_api_manager import get_gemini_model, MODEL_NAME, extract_json_from_text
+
+try:
+    from database.connection import (
+        get_report_analyzer_submissions_collection,
+        is_database_available,
+    )
+except ImportError:
+    def get_report_analyzer_submissions_collection():
+        return None
+
+    def is_database_available():
+        return False
+
+from in_memory_storage import store_report_analyzer_submission_in_memory
 
 load_dotenv()
 
@@ -297,6 +312,54 @@ async def analyze_with_gemini(file_path: str, mime_type: str) -> Dict[str, Any]:
         )
 
 
+def _build_submission_record(
+    result: Dict[str, Any],
+    client_ip: str,
+    file_name: str,
+    file_size: int,
+) -> Dict[str, Any]:
+    """Normalize analysis result for admin dashboard persistence."""
+    patient = result.get("patient") or {}
+    severity = result.get("severity") or {}
+    return {
+        "_id": str(uuid.uuid4()),
+        "timestamp": datetime.utcnow(),
+        "patient_name": patient.get("name"),
+        "patient_age": patient.get("age"),
+        "patient_gender": patient.get("gender"),
+        "symptoms": result.get("symptoms") or [],
+        "medicines": result.get("medicines") or [],
+        "possible_diseases": result.get("possible_diseases") or [],
+        "severity_patient": severity.get("patient", "moderate"),
+        "severity_medicines": severity.get("medicines", "medium"),
+        "summary": result.get("summary"),
+        "client_ip": client_ip,
+        "file_name": file_name,
+        "file_size": file_size,
+    }
+
+
+async def save_report_analyzer_submission(
+    result: Dict[str, Any],
+    client_ip: str,
+    file_name: str,
+    file_size: int,
+) -> None:
+    """Persist report analyzer submission to MongoDB or in-memory fallback."""
+    submission = _build_submission_record(result, client_ip, file_name, file_size)
+    collection = get_report_analyzer_submissions_collection()
+
+    try:
+        if is_database_available() and collection is not None:
+            await collection.insert_one(submission)
+            logger.info("Saved report analyzer submission for file: %s", file_name)
+        else:
+            await store_report_analyzer_submission_in_memory(submission)
+            logger.info("Saved report analyzer submission in memory for file: %s", file_name)
+    except Exception as exc:
+        logger.warning("Failed to persist report analyzer submission: %s", exc)
+
+
 @router.post("/analyze-report")
 async def analyze_report(request: Request, file: UploadFile = File(...)):
     """
@@ -361,6 +424,14 @@ async def analyze_report(request: Request, file: UploadFile = File(...)):
         
         # Analyze with Gemini
         result = await analyze_with_gemini(temp_file, mime_type)
+        
+        # Persist submission for admin dashboard (non-blocking for user response)
+        await save_report_analyzer_submission(
+            result,
+            client_ip=client_ip,
+            file_name=file.filename or "unknown",
+            file_size=len(file_content),
+        )
         
         # Log successful analysis (without PII)
         logger.info(f"Analysis complete. Diseases found: {len(result.get('possible_diseases', []))}")

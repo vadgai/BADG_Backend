@@ -249,13 +249,25 @@ def generate_hindi_pdf(report_data, language='hi'):
     
     diseases = report.get('TopDiseaseMatches', [])
     for idx, disease_obj in enumerate(diseases[:2]):
-        disease_key = list(disease_obj.keys())[0]
-        disease = disease_obj[disease_key]
-        num = disease_key.replace('Disease', '')
+        # Support both flat format {"Name": ..., "MatchLevel": ...}
+        # and old nested format {"Disease1": {"Name1": ..., "MatchLevel1": ...}}
+        if isinstance(disease_obj, dict) and "Name" in disease_obj:
+            # New flat format
+            disease = disease_obj
+            num_suffix = ""  # No number suffix
+        else:
+            # Old nested format
+            disease_key = list(disease_obj.keys())[0] if disease_obj else ""
+            disease = disease_obj.get(disease_key, {})
+            num_suffix = disease_key.replace('Disease', '') if disease_key else str(idx + 1)
+        
+        def _get(field):
+            """Get field from disease dict, trying both flat and numbered key."""
+            return disease.get(field) or disease.get(f"{field}{num_suffix}")
         
         # Disease name and match level
-        disease_name = normalize_text(disease.get(f'Name{num}', 'N/A'))
-        match_level = disease.get(f'MatchLevel{num}', 'N/A')
+        disease_name = normalize_text(_get('Name') or 'N/A')
+        match_level = _get('MatchLevel') or 'N/A'
         
         if language == 'hi':
             match_map = {'High': 'उच्च मिलान', 'Moderate': 'मध्यम मिलान', 'Low': 'कम मिलान'}
@@ -271,7 +283,7 @@ def generate_hindi_pdf(report_data, language='hi'):
         home_care_label = normalize_text("घरेलू देखभाल / स्व-देखभाल:" if language == 'hi' else "Home Care / Self Care:")
         story.append(Paragraph(home_care_label, body_style))
         
-        care_items = disease.get(f'PreHospitalCare{num}', []) + disease.get(f'SelfCare{num}', [])
+        care_items = (_get('PreHospitalCare') or []) + (_get('SelfCare') or [])
         for care in care_items:
             care_text = normalize_text(f"• {care}")
             story.append(Paragraph(care_text, bullet_style))
@@ -279,7 +291,7 @@ def generate_hindi_pdf(report_data, language='hi'):
         story.append(Spacer(1, 2*mm))
         
         # RED FLAG SYMPTOMS
-        red_flags = disease.get(f'SymptomsToWatch{num}', [])
+        red_flags = _get('SymptomsToWatch') or []
         if red_flags:
             red_flag_label = normalize_text("खतरे के संकेत (तुरंत चिकित्सा सहायता लें):" if language == 'hi' else "Red Flag Symptoms (Seek Urgent Medical Help):")
             story.append(Paragraph(red_flag_label, body_style))
@@ -291,7 +303,7 @@ def generate_hindi_pdf(report_data, language='hi'):
             story.append(Spacer(1, 2*mm))
         
         # MEDICATION SUGGESTIONS
-        medications = disease.get(f'MedicationSuggestion{num}', [])
+        medications = _get('MedicationSuggestion') or []
         if medications:
             med_label = normalize_text("दवा के सुझाव (केवल शैक्षिक उद्देश्य के लिए):" if language == 'hi' else "Medication Suggestions (For Educational Purposes Only):")
             story.append(Paragraph(med_label, body_style))

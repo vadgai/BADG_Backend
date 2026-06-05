@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     
     # AI Configuration
     google_api_key: Optional[str] = Field(default=None, description="Google AI API key")
-    ai_model: str = Field(default="gemini-2.5-flash", description="AI model name")
+    ai_model: str = Field(default="gemini-3.1-flash-lite-preview", description="AI model name")
     ai_timeout: int = Field(default=30, description="AI request timeout in seconds")
     
     # Database Configuration (for future use)
