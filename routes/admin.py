@@ -79,41 +79,16 @@ except ImportError:
     def get_report_analyzer_submissions_collection():
         return None
 
-# Try to import auth modules, but make them optional
-try:
-    from auth.security import (
-        authenticate_admin,
-        create_access_token,
-        get_current_admin,
-        get_current_superadmin,
-        JWT_EXPIRY_HOURS
-    )
-    AUTH_AVAILABLE = True
-except ImportError:
-    logger = logging.getLogger(__name__)
-    logger.warning("Auth modules not available - admin features will be disabled")
-    AUTH_AVAILABLE = False
-    # Create dummy functions for type hints
-    def authenticate_admin(username: str, password: str):
-        return None
-    def create_access_token(data: dict):
-        return ""
-    def get_current_admin():
-        return None
-    def get_current_superadmin():
-        return None
-    JWT_EXPIRY_HOURS = 24
-
-# Try to import JWT auth
+# JWT auth for all protected admin routes
 try:
     from auth.jwt_auth import get_current_admin as get_jwt_admin
     JWT_AVAILABLE = True
 except ImportError:
     logger = logging.getLogger(__name__)
-    logger.warning("JWT auth not available")
+    logger.warning("JWT auth not available - admin protected routes will fail")
     JWT_AVAILABLE = False
     def get_jwt_admin():
-        return None
+        raise HTTPException(status_code=500, detail="JWT auth not available")
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -130,6 +105,9 @@ from in_memory_storage import (
     get_dashboard_stats_from_memory,
     get_report_analyzer_submissions_from_memory,
     delete_report_analyzer_submission_from_memory,
+    delete_report_from_memory,
+    get_contacts_from_memory,
+    get_contact_by_id_from_memory,
     in_memory_visits,
     in_memory_reports,
     in_memory_contacts
@@ -297,11 +275,11 @@ async def save_partial_report(payload: dict):
 
 # --- Admin-protected analytics ---
 @public_router.get("/reports")
-async def get_reports(page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100), current_admin=Depends(get_current_admin)):
+async def get_reports(page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100), current_admin=Depends(get_jwt_admin)):
     # Use in-memory data if DB not available
     if not is_database_available():
         logger.info("Using in-memory data for reports")
-        return await get_reports_from_memory(page, limit)
+        return get_reports_from_memory(page, limit)
 
     reports = get_reports_collection()
     skip = (page - 1) * limit
@@ -316,7 +294,7 @@ async def get_visits(page: int = Query(1, ge=1), limit: int = Query(50, ge=1, le
     # Use in-memory data if DB not available
     if not is_database_available():
         logger.info("Using in-memory data for visits")
-        return await get_visits_from_memory(page, limit)
+        return get_visits_from_memory(page, limit)
 
     visits = get_visits_collection()
     skip = (page - 1) * limit
@@ -331,7 +309,7 @@ async def get_dashboard(current_admin=Depends(get_jwt_admin)):
     # Use in-memory data if DB not available
     if not is_database_available():
         logger.info("Using in-memory data for dashboard")
-        stats = await get_dashboard_stats_from_memory()
+        stats = get_dashboard_stats_from_memory()
 
         # Generate some sample data for dashboard
         top_diseases = [
@@ -589,25 +567,22 @@ async def get_visitor_analytics(current_admin=Depends(get_jwt_admin)):
     }
 
 
-@router.get("/me", response_model=AdminResponse)
-async def get_current_admin_info(current_admin=Depends(get_current_admin)):
+@router.get("/me")
+async def get_current_admin_info(current_admin=Depends(get_jwt_admin)):
     """
     Get current admin information
     
     Returns:
         Admin details (without password)
     """
-    return AdminResponse(
-        id=current_admin.id,
-        username=current_admin.username,
-        role=current_admin.role,
-        created_at=current_admin.created_at,
-        last_login=current_admin.last_login
-    )
+    return {
+        "email": current_admin.get("email"),
+        "role": current_admin.get("role", "admin"),
+    }
 
 
 @router.get("/analytics")
-async def get_analytics(current_admin=Depends(get_current_admin)):
+async def get_analytics(current_admin=Depends(get_jwt_admin)):
     """
     Get analytics dashboard data
     
@@ -716,7 +691,7 @@ async def get_analytics(current_admin=Depends(get_current_admin)):
 
 @router.get("/forms")
 async def get_all_forms(
-    current_admin=Depends(get_current_admin),
+    current_admin=Depends(get_jwt_admin),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
     completed_only: bool = Query(False)
@@ -772,7 +747,7 @@ async def get_all_forms(
 
 @router.get("/visits")
 async def get_visit_logs(
-    current_admin=Depends(get_current_admin),
+    current_admin=Depends(get_jwt_admin),
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
     page_name: Optional[str] = None
@@ -828,7 +803,7 @@ async def get_visit_logs(
 
 @router.get("/export")
 async def export_data(
-    current_admin=Depends(get_current_admin),
+    current_admin=Depends(get_jwt_admin),
     data_type: str = Query("forms", regex="^(forms|visits)$"),
     format: str = Query("json", regex="^(json|csv)$")
 ):
@@ -880,7 +855,7 @@ async def get_all_contacts(
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
     form_type: Optional[str] = Query(None, regex="^(contact_page|pricing_page)$"),
-    current_admin=Depends(get_current_admin)
+    current_admin=Depends(get_jwt_admin)
 ):
     """
     Get all contact form submissions (paginated)
@@ -901,17 +876,22 @@ async def get_all_contacts(
         if form_type:
             query["form_type"] = form_type
 
-        # Get total count
-        total = await contact_collection.count_documents(query) if contact_collection is not None else 0
+        if not is_database_available() or contact_collection is None:
+            page = (skip // limit) + 1
+            memory_result = get_contacts_from_memory(page=page, limit=limit, form_type=form_type)
+            return {
+                "total": memory_result["total"],
+                "skip": skip,
+                "limit": limit,
+                "form_type_filter": form_type,
+                "contacts": memory_result["contacts"],
+            }
 
-        # Get contacts
-        if contact_collection is not None:
-            contacts = await contact_collection.find(
-                query,
-                {"_id": 0}  # Exclude MongoDB _id field
-            ).sort("timestamp", -1).skip(skip).limit(limit).to_list(limit)
-        else:
-            contacts = []
+        total = await contact_collection.count_documents(query)
+        contacts = await contact_collection.find(
+            query,
+            {"_id": 0}
+        ).sort("timestamp", -1).skip(skip).limit(limit).to_list(limit)
 
         return {
             "total": total,
@@ -932,7 +912,7 @@ async def get_all_contacts(
 @router.get("/contacts/{contact_id}")
 async def get_contact_by_id(
     contact_id: str,
-    current_admin=Depends(get_current_admin)
+    current_admin=Depends(get_jwt_admin)
 ):
     """
     Get a specific contact submission by ID
@@ -945,16 +925,19 @@ async def get_contact_by_id(
     """
     contact_collection = get_contact_submissions_collection()
 
-    if contact_collection is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Contact data service unavailable"
-        )
-
     try:
+        if not is_database_available() or contact_collection is None:
+            contact = get_contact_by_id_from_memory(contact_id)
+            if not contact:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Contact submission not found"
+                )
+            return contact
+
         contact = await contact_collection.find_one(
             {"id": contact_id},
-            {"_id": 0}  # Exclude MongoDB _id field
+            {"_id": 0}
         )
 
         if not contact:
@@ -979,7 +962,7 @@ async def get_contact_by_id(
 async def get_report_analyzer_submissions(
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
-    current_admin=Depends(get_current_admin),
+    current_admin=Depends(get_jwt_admin),
 ):
     """
     Get paginated medical report analyzer submissions for the admin dashboard.
@@ -1015,7 +998,7 @@ async def get_report_analyzer_submissions(
 @router.delete("/report-analyzer-submissions/{submission_id}")
 async def delete_report_analyzer_submission(
     submission_id: str,
-    current_admin=Depends(get_current_admin),
+    current_admin=Depends(get_jwt_admin),
 ):
     """Delete a report analyzer submission by ID."""
     try:
@@ -1059,8 +1042,41 @@ async def delete_report_analyzer_submission(
         )
 
 
+@router.delete("/reports/{session_id}")
+async def delete_report(
+    session_id: str,
+    current_admin=Depends(get_jwt_admin),
+):
+    """Delete a diagnosis report by session ID."""
+    try:
+        if is_database_available():
+            reports = get_reports_collection()
+            if reports is not None:
+                result = await reports.delete_one({"sessionId": session_id})
+                if result.deleted_count == 0:
+                    result = await reports.delete_one({"session_id": session_id})
+                if result.deleted_count > 0:
+                    return {"success": True, "message": "Report deleted successfully"}
+
+        deleted = delete_report_from_memory(session_id)
+        if not deleted:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Report not found",
+            )
+        return {"success": True, "message": "Report deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Error deleting report %s: %s", session_id, str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error deleting report",
+        )
+
+
 @router.post("/logout")
-async def admin_logout(current_admin=Depends(get_current_admin)):
+async def admin_logout(current_admin=Depends(get_jwt_admin)):
     """
     Admin logout (client should remove token)
 

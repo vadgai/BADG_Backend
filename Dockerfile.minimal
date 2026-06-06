@@ -30,8 +30,10 @@ COPY diagnosis_report ./diagnosis_report
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt || echo "Some packages failed, continuing..."
 
-# Try to download spacy model, but don't fail if it doesn't work
-RUN python -m spacy download en_core_web_sm || echo "Spacy model download skipped"
+# Pin spaCy model (matches spacy==3.7.2)
+RUN pip install --no-cache-dir \
+    https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl \
+    || echo "Spacy model install skipped"
 
 EXPOSE 8080
 

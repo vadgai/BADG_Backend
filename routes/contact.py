@@ -217,7 +217,17 @@ async def submit_contact_form(
             await contact_collection.insert_one(submission.dict())
             logger.info(f"Contact submission stored in database for: {contact_data.email}")
         else:
-            logger.warning("Database unavailable - contact form data not saved")
+            logger.warning("Database unavailable - storing contact submission in memory")
+            from in_memory_storage import store_contact_in_memory
+            import uuid
+            await store_contact_in_memory({
+                "_id": str(uuid.uuid4()),
+                **contact_data.dict(),
+                "timestamp": datetime.utcnow().isoformat(),
+                "ip_address": request.client.host if request.client else None,
+                "user_agent": request.headers.get('user-agent'),
+                "email_sent": False,
+            })
 
         # Send notification email
         email_sent = send_contact_email(contact_data)

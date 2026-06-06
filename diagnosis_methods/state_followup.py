@@ -142,18 +142,9 @@ def _is_generic_question(text: str) -> bool:
 
 
 def _is_repeated_question(question: str, asked_questions: List[str]) -> bool:
-    q = _normalize_text(question)
-    if not q:
-        return True
-    for asked in asked_questions:
-        a = _normalize_text(asked)
-        if not a:
-            continue
-        if q == a:
-            return True
-        if _jaccard(q, a) >= 0.78:
-            return True
-    return False
+    from followup.validators.repetition import is_repeated_question
+
+    return is_repeated_question(question, asked_questions)
 
 
 def _extract_top_two_condition_names(patient_state: Dict) -> List[str]:
@@ -309,6 +300,8 @@ def _deterministic_top2_and_feature(patient_state: Dict) -> Optional[Dict[str, A
     if not profile_1 or not profile_2:
         return None
 
+    from followup.constants import JACCARD_REPEAT_THRESHOLD
+
     asked_questions = _extract_asked_questions(patient_state)
     known = _known_findings_set(patient_state)
     red_flag_terms = set(_normalize_text(item) for item in (red_flags if isinstance(red_flags, list) else []) if _normalize_text(item))
@@ -325,7 +318,7 @@ def _deterministic_top2_and_feature(patient_state: Dict) -> Optional[Dict[str, A
             continue
         if term in top2_term_set:
             continue
-        if any(_jaccard(term, asked) >= 0.78 for asked in asked_questions):
+        if any(_jaccard(term, asked) >= JACCARD_REPEAT_THRESHOLD for asked in asked_questions):
             continue
         opposite = next((str(item.get("term")) for item in top2_terms if str(item.get("term")) not in known), "")
         weight = float(feature.get("weight", 1.0) or 1.0)
@@ -350,7 +343,7 @@ def _deterministic_top2_and_feature(patient_state: Dict) -> Optional[Dict[str, A
             continue
         if term in top1_term_set:
             continue
-        if any(_jaccard(term, asked) >= 0.78 for asked in asked_questions):
+        if any(_jaccard(term, asked) >= JACCARD_REPEAT_THRESHOLD for asked in asked_questions):
             continue
         opposite = next((str(item.get("term")) for item in top1_terms if str(item.get("term")) not in known), "")
         weight = float(feature.get("weight", 1.0) or 1.0)
@@ -523,208 +516,23 @@ def build_contextual_fallback_mcq(patient_state: Dict) -> Union[Dict, str]:
 
 
 def _validate_mcq_quality(mcq: Dict, patient_state: Dict) -> (bool, str):
-    question = str(mcq.get("Question", "")).strip()
-    a = str(mcq.get("A", "")).strip()
-    b = str(mcq.get("B", "")).strip()
-    c = str(mcq.get("C", "")).strip()
-    d = str(mcq.get("D", "")).strip()
-    e = str(mcq.get("E", "")).strip()
-    combined = " ".join([question, a, b, c, d, e]).lower()
+    from followup.validators.mcq_quality import validate_mcq_quality
 
-    if not question or not a or not b or not c or not d:
-        return False, "missing_required_fields"
-    if _contains_placeholder_text(combined):
-        return False, "placeholder_text_detected"
-    if _is_generic_question(question):
-        return False, "generic_question_detected"
-
-    asked_questions = _extract_asked_questions(patient_state)
-    if _is_repeated_question(question, asked_questions):
-        return False, "repeated_question_detected"
-
-    option_keys = {_normalize_text(a), _normalize_text(b), _normalize_text(c), _normalize_text(d)}
-    if len(option_keys) < 4:
-        return False, "non_distinct_options"
-
-    # E must be the escape-hatch option
-    e_norm = _normalize_text(e)
-    if e and "none" not in e_norm and "not sure" not in e_norm:
-        return False, "invalid_option_e"
-
-    return True, "ok"
+    return validate_mcq_quality(mcq, patient_state)
 
 
 def get_followup_from_state(
     patient_state: Dict,
-    top_diseases: Optional[List[Dict]] = None,  # Kept for compatibility, but not used
-    disease_engine=None,  # Kept for compatibility, but not used
-    entropy_tracker=None,  # Kept for compatibility, but not used
+    top_diseases: Optional[List[Dict]] = None,
+    disease_engine=None,
+    entropy_tracker=None,
     max_retries: int = 1,
 ) -> Union[Dict, str, None]:
-    """
-    Generate a follow-up MCQ question using pure LLM clinical reasoning.
+    """Backward-compatible entry — delegates to followup.orchestrator."""
+    del top_diseases, disease_engine, entropy_tracker
+    from followup.orchestrator import get_next_followup_question
 
-    No disease dataset is used. The LLM analyzes the patient's symptoms and
-    full conversation history and applies 4-step clinical reasoning to select
-    the single most useful next question.
-
-    Args:
-        patient_state: Structured patient state dictionary
-        top_diseases: (Deprecated - kept for compatibility)
-        disease_engine: (Deprecated - kept for compatibility)
-        entropy_tracker: (Deprecated - kept for compatibility)
-        max_retries: (Deprecated - kept for compatibility)
-
-    Returns:
-        - dict: MCQ with keys "Question", "A", "B", "C", "D", "E"
-        - str: "Ready for diagnosis"
-        - None: on unrecoverable error
-    """
-    del top_diseases, disease_engine, entropy_tracker, max_retries
-    turn_count = int(patient_state.get("turn_count", 0) or 0)
-    if turn_count >= 12:
-        return "Ready for diagnosis"
-
-    asked_questions = _extract_asked_questions(patient_state)
-
-    # Symptom-based fallback MCQ (no disease dataset used)
-    fallback_mcq = build_contextual_fallback_mcq(patient_state)
-    if isinstance(fallback_mcq, str) and "ready for diagnosis" in fallback_mcq.lower():
-        return "Ready for diagnosis"
-    if not isinstance(fallback_mcq, dict):
-        fallback_mcq = _build_chief_symptom_mcq(patient_state)
-
-    if _is_repeated_question(str(fallback_mcq.get("Question", "")), asked_questions):
-        if turn_count >= 12:
-            return "Ready for diagnosis"
-        fallback_mcq = _build_alternate_contextual_mcq(patient_state, asked_questions)
-
-    from utils.gemini_api_manager import get_gemini_model
-    model_available, model = get_gemini_model()
-    if not model_available or model is None:
-        return fallback_mcq
-
-    symptom_state = patient_state.get("symptom_state") if isinstance(patient_state.get("symptom_state"), dict) else {}
-    demographics = patient_state.get("demographics") if isinstance(patient_state.get("demographics"), dict) else {}
-    age = demographics.get("age", "Unknown")
-    gender = demographics.get("gender", "Unknown")
-    positives = symptom_state.get("current_symptoms") if isinstance(symptom_state.get("current_symptoms"), list) else patient_state.get("identified_symptoms", [])
-    negatives = patient_state.get("negatives") if isinstance(patient_state.get("negatives"), list) else []
-    red_flags = symptom_state.get("red_flags") if isinstance(symptom_state.get("red_flags"), list) else patient_state.get("red_flags", [])
-
-    positives_text = ", ".join(str(s).strip() for s in positives if str(s).strip()) or "None"
-    negatives_text = ", ".join(str(s).strip() for s in negatives if str(s).strip()) or "None"
-    red_flags_text = ", ".join(str(s).strip() for s in red_flags if str(s).strip()) or "None"
-    full_history_text = _format_chat_history(patient_state)
-    asked_questions = symptom_state.get("questions_asked", [])
-    previously_asked_titles = "\n".join(f"- {q}" for q in asked_questions) or "None"
-    chief_complaint = str(patient_state.get("chief_complaint", "")).strip() or positives_text
-
-    # BMI Context
-    bmi_data = demographics.get("bmi", {})
-    bmi_text = ""
-    if bmi_data:
-        bmi_text = f" | BMI: {bmi_data.get('value')} ({bmi_data.get('category')})"
-        if bmi_data.get('is_estimated'):
-            bmi_text += " (Estimated)"
-
-    # Fix C: Build differential diagnosis context from stored state
-    differential = patient_state.get("differential_diagnosis") if isinstance(patient_state.get("differential_diagnosis"), list) else []
-    diff_text = "Not yet established."
-    if differential:
-        diff_lines = []
-        for idx, item in enumerate(differential[:3], 1):
-            if isinstance(item, dict):
-                name = str(item.get("name", "")).strip()
-                confidence = str(item.get("confidence", "")).strip()
-                reasoning = str(item.get("reasoning", "")).strip()
-                if name:
-                    diff_lines.append(f"  #{idx}: {name} ({confidence}) — {reasoning[:80]}")
-        if diff_lines:
-            diff_text = "\n".join(diff_lines)
-
-    # Build differentiator hint
-    differentiator = str(patient_state.get("differentiator_symptom", "")).strip()
-    differentiator_text = f"\n- Key differentiator to confirm: {differentiator}" if differentiator else ""
-
-    # Running summary for quick context
-    running_summary = str(patient_state.get("running_summary", "")).strip()
-    summary_text = f"\n- Clinical summary so far: {running_summary[:200]}" if running_summary else ""
-
-    prompt = f"""Clinical diagnostician. Ask the SINGLE highest-yield next question to separate the top differential diagnoses.
-
-PATIENT: {age}/{gender}{bmi_text} | Chief: {chief_complaint}
-+Confirmed: {positives_text}
--Ruled out: {negatives_text}
-Red flags: {red_flags_text}
-Turn {turn_count + 1}/12{summary_text}{differentiator_text}
-
-DIFFERENTIAL (current top suspects):
-{diff_text}
-
-ALREADY ASKED (never repeat or paraphrase):
-{previously_asked_titles}
-
-CONVERSATION:
-{full_history_text}
-
-SELECT NEXT QUESTION:
-1. Target the one feature that best splits Suspect #1 vs #2. Feature priority: pathognomonic sign > red-flag > severity/functional impact > timing/onset/trigger > location/radiation.
-2. Must add NEW info: not already in confirmed/ruled-out, not similar to any asked question.
-3. Stay within the most likely body system (GI, hepatic, respiratory, cardiac, neuro, urinary, musculoskeletal, endocrine, derm) unless a red flag forces otherwise.
-4. 5-10 plain-English words, no jargon. A-D clinically distinct and mutually exclusive; E = "Not sure / None of these".
-
-EARLY STOP: if turn >= 12, OR top suspect is High-confidence with key differentiators already answered → return {{"ready_for_diagnosis": true}}
-
-Return STRICT JSON only, no markdown:
-{{"Question":"...","A":"...","B":"...","C":"...","D":"...","E":"Not sure / None of these"}}
-"""
-
-    success, raw_text, error = generate_content_with_fallback(
-        prompt=prompt,
-        max_retries=None,
-        temperature=0.2,
-        max_output_tokens=500,
-    )
-    if not success or not raw_text:
-        logger.warning("get_followup_from_state: LLM generation failed: %s", error)
-        fallback_mcq.setdefault("E", "None of these / Not sure")
-        fallback_mcq.setdefault("question_source", "deterministic")
-        return fallback_mcq
-
-    parsed = extract_json_from_text(raw_text.strip())
-    # Fix B: Honor early stop at any turn when LLM has high confidence
-    if isinstance(parsed, dict) and bool(parsed.get("ready_for_diagnosis")):
-        return "Ready for diagnosis"
-
-    if isinstance(parsed, dict):
-        from Followup_Generation.followup import _normalize_mcq_keys, _validate_mcq_structure
-        normalized = _normalize_mcq_keys(parsed)
-        if _validate_mcq_structure(normalized):
-            # Enforce E = escape-hatch option; keep D as a real clinical option
-            normalized.setdefault("E", "None of these / Not sure")
-            e_val = _normalize_text(str(normalized.get("E", "")))
-            if "none" not in e_val and "not sure" not in e_val:
-                normalized["E"] = "None of these / Not sure"
-            ok, reason = _validate_mcq_quality(normalized, patient_state)
-            if ok:
-                normalized.setdefault("allow_other", True)
-                normalized.setdefault("priority", fallback_mcq.get("priority", "high"))
-                normalized.setdefault("clinical_intent", fallback_mcq.get("clinical_intent", "Identify most likely diagnosis from patient history"))
-                normalized.setdefault("differentiates_between", fallback_mcq.get("differentiates_between", []))
-                normalized.setdefault("question_source", "llm")
-                # NOTE: Do NOT append to questions_asked here. The websocket
-                # handler (app.py) is the single source of truth and records the
-                # question only after it is actually selected and sent. Tracking
-                # it here caused the generated question to match itself during the
-                # caller's repeat-check, so every LLM question was wrongly
-                # rejected as "repeated" and replaced by a deterministic fallback.
-                return normalized
-            logger.warning("get_followup_from_state: LLM MCQ rejected (%s), using fallback", reason)
-
-    fallback_mcq.setdefault("E", "None of these / Not sure")
-    fallback_mcq.setdefault("question_source", "deterministic")
-    return fallback_mcq
+    return get_next_followup_question(patient_state, max_retries=max_retries)
 
 
 def analyze_answer_for_state(

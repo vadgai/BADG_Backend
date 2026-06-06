@@ -8,6 +8,11 @@ files = [
     os.path.join("diagnosis_report", "report.py"),
     os.path.join("diagnosis_methods", "state_followup.py"),
     "symptom_extractor.py",
+    os.path.join("followup", "orchestrator.py"),
+    os.path.join("followup", "websocket_handler.py"),
+    os.path.join("followup", "selection.py"),
+    os.path.join("Followup_Generation", "followup_v5.py"),
+    os.path.join("Followup_Generation", "followup.py"),
 ]
 
 all_ok = True

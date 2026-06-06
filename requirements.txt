@@ -41,7 +41,8 @@ jinja2==3.1.3
 
 # NLP - SpaCy
 spacy==3.7.2
-# Note: Download model with: python -m spacy download en_core_web_sm
+# en_core_web_sm 3.7.1 matches spacy 3.7.x (installed in Dockerfile; local: pip install the wheel below)
+# https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
 # Optional scientific model: 
 # https://s3-us-west-2.amazonaws.com/ai2-s-scispacy/releases/v0.5.4/en_core_sci_sm-0.5.4.tar.gz
 

@@ -34,8 +34,9 @@ COPY requirements.txt .
 RUN pip install --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
-# Download spaCy model during build
-RUN python -m spacy download en_core_web_sm
+# Pin spaCy model (spacy download can 404 with missing version in Docker)
+RUN pip install --no-cache-dir \
+    https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
 
 # ============================================
 # Final production image

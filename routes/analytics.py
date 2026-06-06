@@ -171,13 +171,13 @@ telemetry_router.add_api_route(
     response_model=EventResponse,
 )
 telemetry_router.add_api_route(
-    "/session/{session_id}",
-    get_session_info,
-    methods=["GET"],
-)
-telemetry_router.add_api_route(
     "/session/heartbeat",
     session_heartbeat,
     methods=["POST"],
+)
+telemetry_router.add_api_route(
+    "/session/{session_id}",
+    get_session_info,
+    methods=["GET"],
 )
 

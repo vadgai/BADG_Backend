@@ -47,6 +47,7 @@ def _send_career_application_email(
         msg = MIMEMultipart()
         msg["From"] = sender_email
         msg["To"] = ", ".join(recipients)
+        msg["Reply-To"] = email
         msg["Subject"] = f"VADG Careers Application: {job_title} — {name}"
 
         body = f"""New career application via VADG website
@@ -138,7 +139,10 @@ async def submit_career_application(
 
     return {
         "success": True,
-        "message": "Thank you! Your application has been received. We'll review it and get back to you soon.",
+        "message": (
+            "Thank you! Your application has been received and emailed to our team. "
+            "We'll review it and get back to you soon."
+        ),
         "application_id": application_id,
         "email_sent": email_sent,
     }

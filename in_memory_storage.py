@@ -2,7 +2,7 @@
 In-memory storage for admin data when MongoDB is not available
 """
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from datetime import datetime
 
 # Global in-memory storage
@@ -54,6 +54,25 @@ def get_report_analyzer_submissions_from_memory(skip: int = 0, limit: int = 20) 
         "limit": limit,
         "submissions": in_memory_report_analyzer_submissions[skip : skip + limit],
     }
+
+
+def delete_report_from_memory(session_id: str) -> bool:
+    """Delete a diagnosis report from memory by sessionId or session_id."""
+    global in_memory_reports
+    before = len(in_memory_reports)
+    in_memory_reports = [
+        item for item in in_memory_reports
+        if item.get("sessionId") != session_id and item.get("session_id") != session_id
+    ]
+    return len(in_memory_reports) < before
+
+
+def get_contact_by_id_from_memory(contact_id: str) -> Optional[Dict[str, Any]]:
+    """Get a single contact submission from memory by id."""
+    for contact in in_memory_contacts:
+        if contact.get("id") == contact_id:
+            return contact
+    return None
 
 
 def delete_report_analyzer_submission_from_memory(submission_id: str) -> bool:
