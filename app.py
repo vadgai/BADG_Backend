@@ -165,20 +165,25 @@ def _evict_stale_sessions() -> None:
 #
 # --- Application Lifecycle Events ---
 #
-@app.on_event("startup")
-async def startup_event():
-    """Initialize database connection and other startup tasks"""
-    logger.info("🚀 Starting VADG API...")
-    logger.info("PORT: %s", os.getenv("PORT", "8080"))
-    logger.info("Environment: %s", os.getenv("ENVIRONMENT", "development"))
-    
-    # Try MongoDB connection with timeout
-    logger.info("Attempting MongoDB connection...")
+# Holds references to fire-and-forget background tasks so they aren't GC'd.
+_background_tasks = set()
+
+
+async def _background_init():
+    """
+    Connect to MongoDB and run idempotent seeding. Runs as a background task so it
+    never blocks the server from binding the port — critical for Cloud Run, whose
+    startup probe fails the deploy if the container doesn't listen quickly. Every
+    step is time-bounded and guarded so a slow/unavailable database can never wedge
+    startup; the app serves immediately and degrades to in-memory storage until the
+    database is ready.
+    """
+    import asyncio
+    from database.connection import is_database_available
+
+    # 1) Database connection (time-bounded).
     try:
-        import asyncio
-        from database.connection import is_database_available
-        # Set a timeout for MongoDB connection
-        connected = await asyncio.wait_for(connect_to_mongodb(), timeout=5.0)
+        connected = await asyncio.wait_for(connect_to_mongodb(), timeout=10.0)
         if connected and is_database_available():
             logger.info("✅ MongoDB connected")
         else:
@@ -186,32 +191,55 @@ async def startup_event():
     except asyncio.TimeoutError:
         logger.warning("MongoDB connection timeout - continuing without database")
     except Exception as e:
-        logger.warning(f"MongoDB connection skipped: {e}")
-        logger.info("Continuing without MongoDB (core features will still work)")
+        logger.warning("MongoDB connection skipped: %s", e)
 
-    # Ensure the permanent admin account exists (idempotent).
+    # 2) Idempotent seeding (each guarded + time-bounded).
+    async def _run(label, coro_factory):
+        try:
+            await asyncio.wait_for(coro_factory(), timeout=20.0)
+        except Exception as e:
+            logger.error("%s failed/skipped: %s", label, e)
+
     try:
         from auth.seed import seed_permanent_admin
-        await seed_permanent_admin()
+        await _run("Permanent admin seeding", seed_permanent_admin)
     except Exception as e:
-        logger.error("Permanent admin seeding failed: %s", e)
+        logger.error("Permanent admin import failed: %s", e)
 
-    # Seed the default pricing plans if none exist (idempotent).
     try:
         from billing.plans import seed_default_plans
-        await seed_default_plans()
+        await _run("Pricing plan seeding", seed_default_plans)
     except Exception as e:
-        logger.error("Pricing plan seeding failed: %s", e)
+        logger.error("Pricing plan import failed: %s", e)
 
-    # Optionally seed demo users (dev/demo only). Enable with SEED_DUMMY_USERS=true.
     if os.getenv("SEED_DUMMY_USERS", "false").lower() in ("true", "1", "yes", "on"):
         try:
             from auth.seed import seed_dummy_users
-            await seed_dummy_users()
+            await _run("Dummy user seeding", seed_dummy_users)
         except Exception as e:
-            logger.error("Dummy user seeding failed: %s", e)
+            logger.error("Dummy user import failed: %s", e)
 
-    logger.info("✅ Startup complete - Ready to serve requests")
+    logger.info("✅ Background init complete")
+
+
+@app.on_event("startup")
+async def startup_event():
+    """
+    Lightweight startup: kick off DB connect + seeding in the BACKGROUND and return
+    immediately so uvicorn reports ready and the port binds without waiting on the
+    database. This prevents Cloud Run 'failed to start / listen on port' timeouts.
+    """
+    logger.info("🚀 Starting VADG API (PORT=%s, ENV=%s)",
+                os.getenv("PORT", "8080"), os.getenv("ENVIRONMENT", "development"))
+    try:
+        # Keep a reference so the task isn't garbage-collected mid-run.
+        task = asyncio.create_task(_background_init())
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+    except Exception as e:
+        # Never let startup raise — that would fail the container health check.
+        logger.error("Failed to schedule background init: %s", e)
+    logger.info("✅ Startup complete - serving (DB init running in background)")
 
 
 @app.on_event("shutdown")

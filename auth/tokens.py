@@ -27,14 +27,24 @@ logger = logging.getLogger(__name__)
 JWT_SECRET_KEY = os.getenv("ADMIN_JWT_SECRET") or os.getenv("JWT_SECRET_KEY")
 JWT_ALGORITHM = "HS256"
 
+def _safe_int(name: str, default: int) -> int:
+    """Parse an int env var; fall back to default on a malformed value so a bad
+    env var can never crash module import / container startup."""
+    try:
+        return int(str(os.getenv(name, default)).strip())
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s env value; using default %s", name, default)
+        return default
+
+
 # Access token lifetime (minutes). Kept short; refresh token extends the session.
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+ACCESS_TOKEN_EXPIRE_MINUTES = _safe_int("ACCESS_TOKEN_EXPIRE_MINUTES", 60)
 # Refresh token lifetime (days).
-REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
+REFRESH_TOKEN_EXPIRE_DAYS = _safe_int("REFRESH_TOKEN_EXPIRE_DAYS", 30)
 # Email verification link lifetime (hours).
-VERIFY_TOKEN_EXPIRE_HOURS = int(os.getenv("VERIFY_TOKEN_EXPIRE_HOURS", "48"))
+VERIFY_TOKEN_EXPIRE_HOURS = _safe_int("VERIFY_TOKEN_EXPIRE_HOURS", 48)
 # Password reset link lifetime (minutes).
-RESET_TOKEN_EXPIRE_MINUTES = int(os.getenv("RESET_TOKEN_EXPIRE_MINUTES", "30"))
+RESET_TOKEN_EXPIRE_MINUTES = _safe_int("RESET_TOKEN_EXPIRE_MINUTES", 30)
 
 if not JWT_SECRET_KEY:
     logger.critical(

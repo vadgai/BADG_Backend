@@ -30,8 +30,18 @@ except Exception:
 
 from auth import user_service
 
-FREE_REPORTS_PER_DAY = int(os.getenv("FREE_REPORTS_PER_DAY", "1"))
-PAY_PER_REPORT_INR = int(os.getenv("PAY_PER_REPORT_PRICE_INR", "29"))
+def _safe_int(name: str, default: int) -> int:
+    """Parse an int env var, falling back to default on a malformed value.
+    (A bad env var must never crash module import / container startup.)"""
+    try:
+        return int(str(os.getenv(name, default)).strip())
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s env value; using default %s", name, default)
+        return default
+
+
+FREE_REPORTS_PER_DAY = _safe_int("FREE_REPORTS_PER_DAY", 1)
+PAY_PER_REPORT_INR = _safe_int("PAY_PER_REPORT_PRICE_INR", 29)
 
 USAGE_COLLECTION = "report_usage"
 
