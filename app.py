@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Union
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -30,15 +30,21 @@ from followup.constants import MAX_FOLLOWUP_QUESTIONS, MIN_FOLLOWUP_QUESTIONS
 from followup.websocket_handler import handle_followup_websocket
 from diagnosis_rule_engine_v5 import get_final_diagnosis_v5
 from diagnosis_report.report import final_report, build_next_diagnostic_steps
+from symptom_card import generate_symptom_card, apply_symptom_card
 
 # Import database and new route modules
 from database.connection import connect_to_mongodb, close_mongodb_connection
 from routes import admin, form, contact, report_analyzer, translate, disease_info, analytics, careers
-# NOTE: IndicTrans2 integration disabled - using Google/Gemini instead
-# from routes import translateProxy, localizedReport
+# NOTE: IndicTrans2 integration disabled - using Google/Gemini instead.
+# The translateProxy / localizedReport route modules were removed as dead code;
+# restore them from git history if IndicTrans2 is ever re-enabled.
 from routes.admin_analytics import router as admin_analytics_router
 from routes.admin_endpoints import router as admin_endpoints_router
 from routes.admin_insights import router as admin_insights_router
+
+# Billing / entitlements (report limit enforcement)
+from auth.dependencies import get_current_user
+from billing import entitlements as billing_entitlements
 
 # Import new modules (commented out until modules are created)
 # from models import DiagnosisRequest, DiagnosisResponse, ErrorResponse, HealthCheckResponse
@@ -112,6 +118,50 @@ executor = ThreadPoolExecutor(max_workers=4)
 # In-memory session store (hybrid approach with MongoDB)
 session_store: Dict[str, dict] = {}
 
+# Bound the in-memory session store so it cannot grow without limit (memory leak).
+# TTL evicts inactive sessions; the size cap drops the oldest when over the limit.
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TIMEOUT", "3600"))
+MAX_SESSIONS = int(os.getenv("MAX_SESSIONS", "1000"))
+
+
+def _evict_stale_sessions() -> None:
+    """Prune expired sessions (by TTL) and enforce a hard cap on session_store size."""
+    try:
+        now = datetime.utcnow()
+
+        def _last_seen(session: dict) -> str:
+            return session.get("last_activity") or session.get("created_at") or ""
+
+        # 1) TTL eviction based on last activity / creation time.
+        expired = []
+        for sid, session in session_store.items():
+            ts = _last_seen(session)
+            if not ts:
+                continue
+            try:
+                last = datetime.fromisoformat(ts)
+            except (ValueError, TypeError):
+                continue
+            if (now - last).total_seconds() > SESSION_TTL_SECONDS:
+                expired.append(sid)
+        for sid in expired:
+            session_store.pop(sid, None)
+
+        # 2) Hard size cap — drop the oldest sessions first.
+        overflow = len(session_store) - MAX_SESSIONS
+        if overflow > 0:
+            oldest = sorted(session_store.items(), key=lambda kv: _last_seen(kv[1]))
+            for sid, _ in oldest[:overflow]:
+                session_store.pop(sid, None)
+
+        if expired or overflow > 0:
+            logger.info(
+                "session eviction: removed %s expired, %s over-cap (now %s active)",
+                len(expired), max(0, overflow), len(session_store),
+            )
+    except Exception as exc:  # never let cleanup break request handling
+        logger.warning("session eviction error: %s", exc)
+
 #
 # --- Application Lifecycle Events ---
 #
@@ -138,7 +188,29 @@ async def startup_event():
     except Exception as e:
         logger.warning(f"MongoDB connection skipped: {e}")
         logger.info("Continuing without MongoDB (core features will still work)")
-    
+
+    # Ensure the permanent admin account exists (idempotent).
+    try:
+        from auth.seed import seed_permanent_admin
+        await seed_permanent_admin()
+    except Exception as e:
+        logger.error("Permanent admin seeding failed: %s", e)
+
+    # Seed the default pricing plans if none exist (idempotent).
+    try:
+        from billing.plans import seed_default_plans
+        await seed_default_plans()
+    except Exception as e:
+        logger.error("Pricing plan seeding failed: %s", e)
+
+    # Optionally seed demo users (dev/demo only). Enable with SEED_DUMMY_USERS=true.
+    if os.getenv("SEED_DUMMY_USERS", "false").lower() in ("true", "1", "yes", "on"):
+        try:
+            from auth.seed import seed_dummy_users
+            await seed_dummy_users()
+        except Exception as e:
+            logger.error("Dummy user seeding failed: %s", e)
+
     logger.info("✅ Startup complete - Ready to serve requests")
 
 
@@ -154,6 +226,12 @@ async def shutdown_event():
 # --- Include Route Modules ---
 #
 # Include admin analytics routers and form routes
+from routes import auth as auth_routes
+from routes import billing as billing_routes
+from routes import admin_billing as admin_billing_routes
+app.include_router(auth_routes.router)
+app.include_router(billing_routes.router)
+app.include_router(admin_billing_routes.router)
 app.include_router(admin.public_router)
 app.include_router(admin.router)
 app.include_router(admin_analytics_router)
@@ -168,33 +246,39 @@ app.include_router(disease_info.router)
 app.include_router(analytics.router)
 app.include_router(analytics.telemetry_router)
 
-# NOTE: IndicTrans2 routes disabled - using Google/Gemini translation instead
-# app.include_router(translateProxy.router, prefix="/internal/translate")
-# app.include_router(localizedReport.router, prefix="/api/localize-report")
+# NOTE: IndicTrans2 routes disabled - using Google/Gemini translation instead.
+# (translateProxy / localizedReport modules removed as dead code — see note above.)
 
 
 #
 # --- Middleware: log request bodies (for debugging) ---
 #
+# Body logging is opt-in and OFF by default. It logs raw request bodies (patient PII:
+# symptoms, age, location) and must never be enabled in production. Set LOG_REQUEST_BODIES=true
+# only for local debugging.
+LOG_REQUEST_BODIES = os.getenv("LOG_REQUEST_BODIES", "false").strip().lower() in ("1", "true", "yes")
+
+
 @app.middleware("http")
 async def log_request_body_middleware(request: Request, call_next):
     """
-    Logs the body for POST/PUT/PATCH requests for debugging purposes.
-    WARNING: Do not keep detailed body logging in production for PII/security reasons.
+    Optionally logs the body for POST/PUT/PATCH requests for local debugging only.
+    Disabled unless LOG_REQUEST_BODIES=true, because bodies contain patient PII.
     """
-    try:
-        if request.method in ("POST", "PUT", "PATCH"):
-            raw = await request.body()
-            text = raw.decode("utf-8", errors="ignore")
-            try:
-                parsed = json.loads(text) if text else None
-            except Exception:
-                parsed = text
-            logger.info("Incoming request %s %s body=%s", request.method, request.url.path, parsed)
-            # Re-create the request stream so downstream can read it
-            request._body = raw  # internal usage; acceptable for debugging
-    except Exception as e:
-        logger.warning("Could not log request body: %s", e)
+    if LOG_REQUEST_BODIES:
+        try:
+            if request.method in ("POST", "PUT", "PATCH"):
+                raw = await request.body()
+                text = raw.decode("utf-8", errors="ignore")
+                try:
+                    parsed = json.loads(text) if text else None
+                except Exception:
+                    parsed = text
+                logger.info("Incoming request %s %s body=%s", request.method, request.url.path, parsed)
+                # Re-create the request stream so downstream can read it
+                request._body = raw  # internal usage; acceptable for debugging
+        except Exception as e:
+            logger.warning("Could not log request body: %s", e)
     response = await call_next(request)
     return response
 
@@ -424,6 +508,9 @@ async def submit_symptom(payload: DiagnosisRequest):
             logger.warning("extract_initial_symptoms failed: %s. Falling back to normalized symptoms list.", e)
             extracted_symptoms = fallback_list
 
+        # Bound memory before adding a new session.
+        _evict_stale_sessions()
+
         # Create session with enhanced patient data
         session_id = str(uuid.uuid4())
         # Initialize v5 patient state for reasoning loop
@@ -496,38 +583,8 @@ async def submit_symptom(payload: DiagnosisRequest):
         )
 
 
-@app.options("/debug_sessions")
-async def options_debug_sessions():
-    """Handle OPTIONS requests for /debug_sessions endpoint"""
-    return JSONResponse(content={}, status_code=200)
-
-@app.get("/debug_sessions")
-def debug_sessions():
-    """Get debug information about all sessions."""
-    try:
-        return {
-            "session_count": len(session_store),
-            "session_ids": list(session_store.keys()),
-            "active_sessions": [
-                {
-                    "session_id": sid,
-                    "name": session.get("name", "Unknown"),
-                    "age": session.get("age"),
-                    "gender": session.get("gender", "unknown"),
-                    "symptom_count": len(session.get("symptoms", [])),
-                    "question_count": session.get("question_count", 0),
-                    "structured_symptom_count": len(
-                        (session.get("symptom_state") or {}).get("current_symptoms", [])
-                    ) if isinstance(session.get("symptom_state"), dict) else 0,
-                    "created_at": session.get("created_at"),
-                    "last_activity": session.get("last_activity")
-                }
-                for sid, session in session_store.items()
-            ]
-        }
-    except Exception as e:
-        logger.error("Error getting debug sessions: %s", e)
-        return {"error": "Failed to get session information"}
+# NOTE: The unauthenticated /debug_sessions endpoint was removed — it exposed
+# every patient's name/age/gender/symptom counts with no auth (privacy leak).
 
 @app.options("/session/{session_id}")
 async def options_session(session_id: str):  # pylint: disable=unused-argument
@@ -563,6 +620,70 @@ async def get_session_data(session_id: str):
 
 
 #
+# --- Symptom selection cards (bracket the follow-up questionnaire) ---
+#
+class SymptomCardSubmission(BaseModel):
+    """Selections from a symptom card."""
+    offered: List[str] = []       # all symptom labels the card presented
+    selected: List[str] = []      # the subset the patient checked
+    factors: Dict = {}            # clinical-history answers (initial card only)
+
+
+@app.options("/symptom_card/{session_id}")
+async def options_symptom_card(session_id: str):  # pylint: disable=unused-argument
+    return JSONResponse(content={}, status_code=200)
+
+
+@app.get("/symptom_card/{session_id}")
+async def get_symptom_card(session_id: str, stage: str = "initial"):
+    """Generate a symptom-selection card (stage=initial before follow-up, refined after)."""
+    if session_id not in session_store:
+        raise HTTPException(status_code=404, detail="Session not found")
+    session = session_store[session_id]
+    patient_state = session.get("patient_state") if isinstance(session.get("patient_state"), dict) else {}
+    stage = stage if stage in ("initial", "refined") else "initial"
+    try:
+        loop = asyncio.get_event_loop()
+        card = await loop.run_in_executor(executor, generate_symptom_card, patient_state, stage)
+        return JSONResponse(content={"session_id": session_id, **card}, status_code=200)
+    except Exception as e:
+        logger.exception("Error generating symptom card for %s: %s", session_id, e)
+        # Non-fatal: an empty card lets the frontend skip straight to follow-up.
+        return JSONResponse(
+            content={"session_id": session_id, "stage": stage, "top_conditions": [],
+                     "symptoms": [], "clinical_factors": [], "instruction": ""},
+            status_code=200,
+        )
+
+
+@app.post("/symptom_card/{session_id}")
+async def submit_symptom_card(session_id: str, payload: SymptomCardSubmission):
+    """Merge a submitted symptom card into the session's patient_state."""
+    if session_id not in session_store:
+        raise HTTPException(status_code=404, detail="Session not found")
+    session = session_store[session_id]
+    patient_state = session.get("patient_state") if isinstance(session.get("patient_state"), dict) else {}
+    try:
+        patient_state = apply_symptom_card(
+            patient_state, payload.offered, payload.selected, payload.factors
+        )
+        symptom_state = patient_state.get("symptom_state", {}) if isinstance(patient_state.get("symptom_state"), dict) else {}
+        session["patient_state"] = patient_state
+        session["symptom_state"] = symptom_state
+        session["symptoms"] = patient_state.get("identified_symptoms", [])
+        session["negatives"] = patient_state.get("negatives", [])
+        session["last_activity"] = datetime.utcnow().isoformat()
+        return {
+            "status": "ok",
+            "identified_symptoms": patient_state.get("identified_symptoms", []),
+            "negatives_count": len(patient_state.get("negatives", [])),
+        }
+    except Exception as e:
+        logger.exception("Error applying symptom card for %s: %s", session_id, e)
+        raise HTTPException(status_code=500, detail="Failed to apply symptom card")
+
+
+#
 # --- Robust WebSocket follow-up handler (single handler) ---
 #
 @app.websocket("/followup/{session_id}")
@@ -580,20 +701,36 @@ async def options_generate_report(session_id: str):  # pylint: disable=unused-ar
     return JSONResponse(content={}, status_code=200)
 
 @app.get("/generate_report/{session_id}")
-async def generate_report(session_id: str, lang: str = "en"):
+async def generate_report(session_id: str, lang: str = "en", current_user: dict = Depends(get_current_user)):
     """
     Generate medical report for a session with optional language localization.
-    
+
+    Requires authentication and consumes one report entitlement (the daily free
+    report or a paid credit). Consumption is idempotent per session_id, so
+    re-fetching, exporting, or switching languages for the same diagnosis is free.
+
     Args:
         session_id: The session ID
         lang: Target language code (en, hi, ta, te, bn, kn). Default: "en"
-    
+
     Returns:
         Report in requested language (localized if lang != "en")
     """
     try:
         if session_id not in session_store:
             raise HTTPException(status_code=404, detail="Session not found")
+
+        # --- Enforce report limits (free 1/day, then paid credits) ---------
+        gate = await billing_entitlements.check_and_consume(current_user, session_id)
+        if not gate.get("allowed"):
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "code": "no_reports_remaining",
+                    "message": "You've used your free report for today. Purchase a plan to generate more.",
+                    "balance": gate.get("balance"),
+                },
+            )
 
         session = session_store[session_id]
         name = session.get("name", "Unknown")
@@ -860,7 +997,56 @@ async def generate_report(session_id: str, lang: str = "en"):
 
             # Normalize report structure for frontend/PDF robustness
             report = _normalize_report_for_frontend(report, session, mapped_diseases)
-            
+
+            # Record the diagnosis outcome against the user's report history so it
+            # shows up in their profile. Best-effort — must never break the report.
+            try:
+                def _top_disease(rep):
+                    matches = rep.get("TopDiseaseMatches") if isinstance(rep, dict) else None
+                    if isinstance(matches, list) and matches:
+                        first = matches[0]
+                        if isinstance(first, dict):
+                            for k in ("Disease", "DiseaseName", "Name", "Condition"):
+                                if first.get(k):
+                                    return str(first[k])
+                            dkey = next((k for k in first.keys() if str(k).startswith("Disease")), None)
+                            if dkey and first.get(dkey):
+                                return str(first[dkey])
+                        elif isinstance(first, str):
+                            return first
+                    return None
+                def _all_diseases(rep):
+                    out = []
+                    matches = rep.get("TopDiseaseMatches") if isinstance(rep, dict) else None
+                    if isinstance(matches, list):
+                        for m in matches:
+                            if isinstance(m, dict):
+                                for k in ("Disease", "DiseaseName", "Name", "Condition"):
+                                    if m.get(k):
+                                        out.append(str(m[k]))
+                                        break
+                                else:
+                                    dk = next((k for k in m.keys() if str(k).startswith("Disease")), None)
+                                    if dk and m.get(dk):
+                                        out.append(str(m[dk]))
+                            elif isinstance(m, str):
+                                out.append(m)
+                    return out
+                _disease = _top_disease(report)
+                _symptoms = symptoms if isinstance(symptoms, list) else None
+                _summary = (running_summary_for_report or "").strip() or None
+                await billing_entitlements.enrich_usage(
+                    session_id,
+                    disease=_disease,
+                    diseases=_all_diseases(report),
+                    symptoms=_symptoms,
+                    summary=_summary,
+                    age=age,
+                    gender=gender,
+                )
+            except Exception as _enrich_err:
+                logger.warning("Report-history enrichment skipped: %s", _enrich_err)
+
             # NOTE: IndicTrans2 translation service integration disabled
             # Currently using Google/Gemini for all translation (via /api/translate)
             # The lang parameter is kept for frontend compatibility but not used for backend translation
@@ -893,11 +1079,6 @@ async def generate_report(session_id: str, lang: str = "en"):
         else:
             raise HTTPException(status_code=500, detail="Failed to generate medical report")
             
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Error generating report for session %s: %s", session_id, e)
-        raise HTTPException(status_code=500, detail="Internal Server Error generating report")
     except HTTPException:
         raise
     except Exception as e:

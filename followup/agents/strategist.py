@@ -75,7 +75,34 @@ def plan_next_question(patient_state: Dict[str, Any]) -> Optional[Dict[str, Any]
 
 
 def build_strategy_context(patient_state: Dict[str, Any]) -> str:
-    """Compact hint for the LLM writer about what dimension to target next."""
+    """
+    Compact hint for the LLM writer about what dimension to target next.
+
+    Prefers expected-information-gain selection over the belief state (picks the
+    finding whose answer most reduces diagnostic uncertainty). Falls back to the
+    older utility-score discriminator if EIG cannot be computed.
+    """
+    # Preferred path: information-gain over the posterior.
+    try:
+        from followup.information_gain import select_by_information_gain
+        ig = select_by_information_gain(patient_state)
+    except Exception:
+        ig = None
+
+    if isinstance(ig, dict) and ig.get("feature_term") and ig.get("top_two"):
+        top_two = ig["top_two"]
+        competitor = top_two[1] if len(top_two) > 1 else "alternate diagnosis"
+        stop_hint = (
+            " The differential is already concentrated — conclude if its key differentiators are answered."
+            if ig.get("ready")
+            else ""
+        )
+        return (
+            f"Highest-information-gain question: probe the '{ig['dimension']}' dimension "
+            f"(e.g. {ig['feature_term']}) — it best separates {top_two[0]} vs {competitor}.{stop_hint}"
+        )
+
+    # Fallback: previous utility-score discriminator.
     try:
         result = _deterministic_top2_and_feature(patient_state)
     except Exception:

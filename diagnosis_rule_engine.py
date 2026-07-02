@@ -166,6 +166,58 @@ def _expand_synonyms(term: str) -> List[str]:
     return list(dict.fromkeys(expansions))  # deduplicate preserving order
 
 
+def _tokenize(value: Any) -> List[str]:
+    return re.findall(r"[a-z0-9]+", str(value or "").lower())
+
+
+def _phrase_contains(haystack_tokens: List[str], needle_tokens: List[str]) -> bool:
+    """True if needle_tokens appear as a contiguous whole-word run in haystack_tokens."""
+    n = len(needle_tokens)
+    if n == 0 or n > len(haystack_tokens):
+        return False
+    for i in range(len(haystack_tokens) - n + 1):
+        if haystack_tokens[i:i + n] == needle_tokens:
+            return True
+    return False
+
+
+# Qualifier words that split a compound feature into HEAD (the actual finding)
+# and TAIL (its trigger/context), e.g. "leakage w/ cough" → head "leakage".
+_QUALIFIER_SPLIT = re.compile(r"\b(?:w|with|during|after|when|while|on|upon|following)\b")
+
+
+def _head_tokens(tokens: List[str]) -> List[str]:
+    """Tokens of the finding itself, before any trigger/context qualifier."""
+    for idx, tok in enumerate(tokens):
+        if _QUALIFIER_SPLIT.fullmatch(tok):
+            return tokens[:idx] if idx > 0 else tokens
+    return tokens
+
+
+def _terms_match(a: str, b: str) -> bool:
+    """
+    Whole-word phrase match. True when a == b, or one is a contiguous word-level
+    subphrase of the other (e.g. "abdominal pain" ⊆ "right lower abdominal pain").
+
+    Two guards against false positives:
+    - token boundaries (no "ill" ⊆ "chills" / "art" ⊆ "heart"), and
+    - qualifier heads: for compound terms like "leakage w/ cough", the finding is
+      the HEAD ("leakage"), and a shorter term may only match if it overlaps the
+      head — so a patient's "cough" no longer matches "leakage w/ cough".
+    """
+    at = _tokenize(a)
+    bt = _tokenize(b)
+    if not at or not bt:
+        return False
+    if at == bt:
+        return True
+    if _phrase_contains(bt, at):  # a is the shorter phrase inside b
+        return _phrase_contains(_head_tokens(bt), at)
+    if _phrase_contains(at, bt):  # b is the shorter phrase inside a
+        return _phrase_contains(_head_tokens(at), bt)
+    return False
+
+
 def _feature_match(term: str, values: List[str]) -> bool:
     if not term:
         return False
@@ -173,15 +225,12 @@ def _feature_match(term: str, values: List[str]) -> bool:
     expanded_terms = _expand_synonyms(term)
     for candidate in expanded_terms:
         for value in values:
-            if not value:
-                continue
-            if candidate == value or candidate in value or value in candidate:
+            if value and _terms_match(candidate, value):
                 return True
     # Also expand values side for abbreviations in patient answers
     for value in values:
-        expanded_values = _expand_synonyms(value)
-        for expanded_val in expanded_values:
-            if term == expanded_val or term in expanded_val or expanded_val in term:
+        for expanded_val in _expand_synonyms(value):
+            if _terms_match(term, expanded_val):
                 return True
     return False
 
@@ -287,11 +336,19 @@ def load_diseases_from_folder(folder_path: Optional[str] = None) -> int:
             
             disease_id = disease_data.get("id") or disease_data.get("code") or json_file.stem
             disease_name = disease_data.get("name", "Unknown Disease")
-            
-            if disease_id in DISEASE_REGISTRY:
-                logger.warning(f"Duplicate disease ID {disease_id} in {json_file.name}")
-            
-            DISEASE_REGISTRY[disease_id] = disease_data
+
+            # Key the registry by the (always-unique) filename stem, NOT by id/code.
+            # Many files reuse the same id/code (e.g. an old "symptoms"-schema file and
+            # a newer "key_symptoms" file both tagged D001), which previously caused the
+            # earlier disease to be silently overwritten — ~20 conditions were dropped.
+            # Preserve the declared id/code inside the record for display/traceability.
+            disease_data.setdefault("id", disease_id)
+            registry_key = json_file.stem
+            if registry_key in DISEASE_REGISTRY:
+                logger.warning(f"Duplicate disease file {json_file.name}; skipping")
+                continue
+
+            DISEASE_REGISTRY[registry_key] = disease_data
             loaded_count += 1
             logger.debug(f"Loaded disease: {disease_id} - {disease_name}")
             
@@ -314,7 +371,8 @@ def build_disease_profiles() -> List[Dict[str, Any]]:
     global DISEASE_REGISTRY, DISEASE_PROFILES
 
     profiles: List[Dict[str, Any]] = []
-    for disease_id, disease_data in DISEASE_REGISTRY.items():
+    for registry_key, disease_data in DISEASE_REGISTRY.items():
+        disease_id = disease_data.get("id") or disease_data.get("code") or registry_key
         name = str(disease_data.get("name", "Unknown")).strip()
         symptoms_block = disease_data.get("symptoms", {}) if isinstance(disease_data.get("symptoms"), dict) else {}
 
@@ -374,9 +432,30 @@ def build_disease_profiles() -> List[Dict[str, Any]]:
         }
         profiles.append(profile)
 
-    DISEASE_PROFILES = profiles
-    logger.info("✅ Built %s disease profile(s)", len(profiles))
-    return profiles
+    # Deduplicate genuine same-name conditions (a handful of files repeat a disease
+    # under different ids). Keep the richer profile so both copies don't split the
+    # ranking. Distinct conditions that merely share a word (e.g. "Hepatitis" vs
+    # "Hepatitis A") keep their own normalized names and are unaffected.
+    def _profile_richness(p: Dict[str, Any]) -> int:
+        feats = p.get("features", {}) if isinstance(p.get("features"), dict) else {}
+        return sum(len(feats.get(bucket, []) or []) for bucket in ("key", "supportive", "rare", "exclude"))
+
+    by_name: Dict[str, Dict[str, Any]] = {}
+    for profile in profiles:
+        name_key = _normalize_text(profile.get("name"))
+        if not name_key:
+            by_name[profile.get("id", id(profile))] = profile
+            continue
+        existing = by_name.get(name_key)
+        if existing is None or _profile_richness(profile) > _profile_richness(existing):
+            by_name[name_key] = profile
+    deduped = list(by_name.values())
+
+    DISEASE_PROFILES = deduped
+    logger.info(
+        "✅ Built %s disease profile(s) (%s after name-dedup)", len(profiles), len(deduped)
+    )
+    return deduped
 
 
 def score_disease_match(
@@ -430,6 +509,8 @@ def score_disease_match(
     contradiction_penalty = 0.0
     exclude_penalty = 0.0
 
+    key_feature_count = 0
+    matched_key_count = 0
     feature_buckets = [
         ("key", 1.25, 0.95),
         ("supportive", 0.75, 0.55),
@@ -447,12 +528,22 @@ def score_disease_match(
                 weight_value = 1.0
             weighted_max = pos_factor * weight_value
             positive_max += weighted_max
+            if bucket_name == "key":
+                key_feature_count += 1
             if _feature_match(term, positives):
                 positive_score += weighted_max
                 details["matched_positive_features"].append(term)
+                if bucket_name == "key":
+                    matched_key_count += 1
             if _feature_match(term, negatives_norm):
                 contradiction_penalty += (neg_factor * weight_value)
                 details["contradicted_features"].append(term)
+
+    # Coverage of the disease's own key (defining) features by the patient's positives.
+    # Used to gate high-confidence labels so a single incidental match cannot read "High".
+    details["matched_key_count"] = matched_key_count
+    details["key_feature_count"] = key_feature_count
+    details["key_coverage"] = round(matched_key_count / key_feature_count, 3) if key_feature_count else 0.0
 
     for feature in disease_profile.get("features", {}).get("exclude", []):
         term = _normalize_text(feature.get("term"))
@@ -621,9 +712,19 @@ def analyze_case(
         score = disease_data["score"]
         details = disease_data["details"]
         
-        if score >= 0.72:
+        # Evidence-aware confidence banding. The raw score saturates near 1.0 for
+        # many candidates, so a strong score alone is not enough for "High" — the
+        # patient must also cover a meaningful share of the disease's defining
+        # (key) features. This prevents thin, single-feature matches from being
+        # presented to patients as high-confidence.
+        matched_key = details.get("matched_key_count", 0)
+        key_coverage = details.get("key_coverage", 0.0)
+        if score >= 0.72 and matched_key >= 2 and key_coverage >= 0.4:
             probability = "High"
-        elif score >= 0.48:
+        elif score >= 0.48 and (matched_key >= 1 or key_coverage >= 0.25):
+            probability = "Moderate"
+        elif score >= 0.72:
+            # Strong score but thin key-feature coverage → cap at Moderate.
             probability = "Moderate"
         else:
             probability = "Low"
@@ -661,8 +762,20 @@ def analyze_case(
             },
         })
     
+    # Enforce monotonic confidence: a lower-ranked condition must never display a
+    # higher confidence label than one ranked above it (conditions are sorted by
+    # score). Keeps the confidence column consistent with the ranking order.
+    _prob_rank = {"High": 2, "Moderate": 1, "Low": 0}
+    _rank_prob = {2: "High", 1: "Moderate", 0: "Low"}
+    ceiling = 2
+    for cond in conditions:
+        current = _prob_rank.get(cond["probability"], 0)
+        capped = min(current, ceiling)
+        cond["probability"] = _rank_prob[capped]
+        ceiling = capped
+
     follow_up_questions = build_followup_questions(top_diseases, symptoms, "")
-    
+
     return {
         "conditions": conditions,
         "follow_up_questions": follow_up_questions

@@ -410,8 +410,24 @@ def get_final_diagnosis_v5(
         modifiers=modifiers,
         red_flags=red_flags if isinstance(red_flags, list) else [],
     )
-    fallback = _fallback_from_rule(rule_result)
-    candidate_pool = _extract_candidate_pool(rule_result)
+
+    # Primary ranking = the belief-state posterior (the SAME distribution that drove
+    # the follow-up questions, and which factors in duration/lifestyle/history), so
+    # the final report is consistent with the loop. Falls back to the raw rule
+    # ranking if the belief state can't be built (e.g. no structured positives).
+    belief = None
+    if isinstance(patient_state, dict):
+        try:
+            from followup.information_gain import rank_final_diagnoses
+            belief = rank_final_diagnoses(patient_state, limit=3)
+        except Exception as exc:
+            logger.warning("get_final_diagnosis_v5: belief ranking failed: %s", exc)
+    if belief and belief.get("conditions"):
+        fallback = {"conditions": belief["conditions"]}
+        candidate_pool = _extract_candidate_pool(fallback)
+    else:
+        fallback = _fallback_from_rule(rule_result)
+        candidate_pool = _extract_candidate_pool(rule_result)
 
     if not _DIAG_V6_SCORER:
         return fallback

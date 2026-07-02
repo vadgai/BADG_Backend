@@ -192,7 +192,29 @@ async def create_indexes():
         await _database.report_analyzer_submissions.create_index(
             "timestamp", expireAfterSeconds=2592000
         )
-        
+
+        # auth_users indexes (permanent user accounts — NOT the TTL `users`
+        # collection above, which holds temporary diagnosis sessions).
+        await _database.auth_users.create_index("email", unique=True)
+        await _database.auth_users.create_index("role")
+        await _database.auth_users.create_index([("created_at", -1)])
+
+        # Billing: pricing plans, payments ledger, report usage.
+        await _database.pricing_plans.create_index("code", unique=True)
+        await _database.pricing_plans.create_index("sort_order")
+
+        await _database.payments.create_index("order_id", unique=True)
+        await _database.payments.create_index("user_id")
+        await _database.payments.create_index("status")
+        await _database.payments.create_index([("created_at", -1)])
+
+        # report_usage: idempotency key + analytics. NO TTL — usage is a
+        # permanent billing/audit record.
+        await _database.report_usage.create_index("session_id", unique=True)
+        await _database.report_usage.create_index("user_id")
+        await _database.report_usage.create_index("source")
+        await _database.report_usage.create_index([("created_at", -1)])
+
         logger.info("✅ Database indexes created successfully")
         
     except Exception as e:
@@ -210,6 +232,12 @@ def get_admin_collection():
     """Get admin collection"""
     db = get_database()
     return db.admin if db is not None else None
+
+
+def get_auth_users_collection():
+    """Get auth_users collection (permanent user accounts)."""
+    db = get_database()
+    return db.auth_users if db is not None else None
 
 
 def get_visit_logs_collection():

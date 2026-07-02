@@ -32,15 +32,15 @@ def main():
         import uvicorn
         
         logger.info("✅ Simplified app loaded successfully")
-        logger.info("🌐 Starting server on http://localhost:8000")
-        logger.info("📚 API docs available at http://localhost:8000/docs")
+        logger.info("🌐 Starting server on http://localhost:8080")
+        logger.info("📚 API docs available at http://localhost:8080/docs")
         logger.info("🛑 Press Ctrl+C to stop the server")
         
         # Run the server
         uvicorn.run(
             app,
             host="0.0.0.0",
-            port=8000,
+            port=8080,
             reload=True,
             log_level="info"
         )

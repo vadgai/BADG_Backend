@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from dotenv import load_dotenv
 
 from utils.gemini_api_manager import (
@@ -190,6 +191,35 @@ def build_next_diagnostic_steps(report_obj, mapping_data=None) -> list:
         steps.append("Review all results with your doctor to finalize diagnosis and next treatment steps.")
 
     return steps[:6]
+
+
+def _grade_urgency(has_red_flag: bool, mapped_diseases, symptom_state) -> str:
+    """
+    Graded triage urgency: Emergency > Urgent > Routine.
+
+    - Emergency: an active red flag is present.
+    - Urgent: no red flag, but a high-acuity condition is among the top suspects
+      (rule engine flagged it Emergency/Urgent) or the patient reports severe
+      (>=7/10) symptom intensity — warrants same-day review.
+    - Routine: otherwise.
+    """
+    if has_red_flag:
+        return "Emergency"
+
+    conditions = mapped_diseases.get("conditions", []) if isinstance(mapped_diseases, dict) else []
+    for cond in conditions[:2]:
+        if isinstance(cond, dict) and str(cond.get("urgency", "")).strip().lower() in {"emergency", "urgent"}:
+            return "Urgent"
+
+    modifier_map = symptom_state.get("modifier_map", {}) if isinstance(symptom_state, dict) else {}
+    severity = str(modifier_map.get("severity", "")).strip().lower()
+    if "severe" in severity:
+        return "Urgent"
+    sev_match = re.match(r"\s*(\d+)\s*/\s*10", severity)
+    if sev_match and int(sev_match.group(1)) >= 7:
+        return "Urgent"
+
+    return "Routine"
 
 
 def _format_chat_history(history: list) -> str:
@@ -510,8 +540,8 @@ def final_report(
 
         # Constraint #1: Main symptoms must come ONLY from confirmed symptoms.
         parsed_json["MainSymptoms"] = confirmed_symptoms
-        # Constraint #3: Urgency escalation on red flags.
-        parsed_json["Urgency"] = "Emergency" if has_red_flag else "Routine"
+        # Constraint #3: graded urgency (Emergency > Urgent > Routine).
+        parsed_json["Urgency"] = _grade_urgency(has_red_flag, mapped_diseases, state)
 
         # Ensure TopDiseaseMatches use rule-engine names when LLM omits or mislabels them.
         if isinstance(mapped_diseases, dict):

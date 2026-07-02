@@ -12,6 +12,19 @@ from typing import Optional
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from fastapi.concurrency import run_in_threadpool
+
+
+def _clean_header(value: str) -> str:
+    """Strip CR/LF (and control chars) from user input used in email headers.
+
+    Prevents SMTP/email header injection (e.g. a newline in the name field
+    injecting extra Bcc/Cc headers). Also length-caps the value.
+    """
+    text = str(value or "")
+    text = text.replace("\r", " ").replace("\n", " ")
+    text = "".join(ch for ch in text if ch == " " or ord(ch) >= 32)
+    return text.strip()[:200]
 
 # Try to import database models, make them optional
 try:
@@ -119,10 +132,11 @@ def send_contact_email(contact_data: ContactSubmissionCreate) -> bool:
         msg['To'] = ", ".join(RECIPIENT_EMAILS)
 
         # Set subject based on form type
+        safe_name = _clean_header(contact_data.name)
         if getattr(contact_data, 'organizationName', None) or getattr(contact_data, 'preferredModel', None):
-            msg['Subject'] = f"New Contact Sales Inquiry from {contact_data.name}"
+            msg['Subject'] = f"New Contact Sales Inquiry from {safe_name}"
         else:
-            msg['Subject'] = f"New Contact Form Submission from {contact_data.name}"
+            msg['Subject'] = f"New Contact Form Submission from {safe_name}"
 
         # Email body based on form type
         if getattr(contact_data, 'organizationName', None) or getattr(contact_data, 'preferredModel', None):
@@ -229,8 +243,8 @@ async def submit_contact_form(
                 "email_sent": False,
             })
 
-        # Send notification email
-        email_sent = send_contact_email(contact_data)
+        # Send notification email (blocking SMTP → run off the event loop)
+        email_sent = await run_in_threadpool(send_contact_email, contact_data)
 
         # Update email_sent status if database is available
         if is_database_available() and contact_collection:
@@ -251,8 +265,8 @@ async def submit_contact_form(
         # Return success anyway (graceful degradation)
         # The email might still be sent even if database fails
         try:
-            email_sent = send_contact_email(contact_data)
-        except:
+            email_sent = await run_in_threadpool(send_contact_email, contact_data)
+        except Exception:
             email_sent = False
 
         return {

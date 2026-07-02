@@ -113,35 +113,49 @@ from in_memory_storage import (
     in_memory_contacts
 )
 
-# Static admin credentials and token (per requirements)
-ADMIN_EMAIL = "m87.krishna@gmail.com"
-ADMIN_PASSWORD = "Vadg@44"
-ADMIN_TOKEN = "admin-session-token"
-
-# Lightweight token guard for admin-only routes
-async def require_admin_token(authorization: Optional[str] = Header(default=None)):
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid token")
-    token = authorization.split(" ", 1)[1].strip()
-    if token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return True
+# Admin credentials/secret live in the environment only (see auth/jwt_auth.py).
+# The previous hardcoded credentials and static "admin-session-token" guard were
+# removed; all protected admin routes use JWT auth via Depends(get_jwt_admin).
 
 
 @router.post("/login")
 async def admin_login(credentials: dict):
-    """JWT-based admin login returning a JWT token."""
-    from auth.jwt_auth import authenticate_admin, create_access_token
+    """
+    Admin dashboard login. Accepts EITHER:
+      1) the legacy env-configured admin (ADMIN_EMAIL/ADMIN_PASSWORD), or
+      2) any admin-role user in the auth_users collection (e.g. the permanent
+         admin m87.krishna@gmail.com), authenticated against their stored hash.
+    Returns a JWT the admin endpoints accept.
+    """
+    from auth.jwt_auth import authenticate_admin, create_access_token as create_env_admin_token
 
     email = str(credentials.get("email", "")).strip()
     password = str(credentials.get("password", "")).strip()
 
+    # 1) Legacy env admin
     admin_data = authenticate_admin(email, password)
-    if not admin_data:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if admin_data:
+        return {"success": True, "token": create_env_admin_token(admin_data)}
 
-    token = create_access_token(admin_data)
-    return {"success": True, "token": token}
+    # 2) Database admin user (role == "admin")
+    try:
+        from auth import user_service
+        from auth.password import verify_password
+        from auth.tokens import create_access_token as create_user_token
+
+        user = await user_service.get_user_by_email(email)
+        if (
+            user
+            and user.get("role") == "admin"
+            and user.get("is_active", True)
+            and verify_password(password, user.get("password_hash", ""))
+        ):
+            await user_service.set_last_login(str(user["_id"]))
+            return {"success": True, "token": create_user_token(user)}
+    except Exception as e:  # DB/auth modules unavailable — fall through to 401
+        logger.warning("DB admin login path failed: %s", e)
+
+    raise HTTPException(status_code=401, detail="Invalid credentials")
 
 
 # --- Public ingestion endpoints (no admin token) ---

@@ -104,7 +104,7 @@ def _load_api_keys():
         if loaded_from:
             logger.info(f"   Source: {loaded_from}")
         for idx, key in enumerate(_api_keys, 1):
-            logger.info(f"   Key {idx}: {key[:15]}...{key[-5:]}" if len(key) > 20 else f"   Key {idx}: {key}")
+            logger.info(f"   Key {idx}: ****{key[-4:]}" if len(key) >= 4 else f"   Key {idx}: ****")
         logger.info("="*80)
     
     return _api_keys
@@ -118,7 +118,7 @@ def _try_configure_model(api_key: str, key_index: int) -> Tuple[bool, Optional[o
     try:
         logger.info(f"🔧 Attempting to configure with API key #{key_index + 1}...")
         logger.info(f"   Model name: {MODEL_NAME}")
-        logger.info(f"   API key prefix: {api_key[:10]}..." if len(api_key) > 10 else "   API key: [too short]")
+        logger.info(f"   API key: ****{api_key[-4:]}" if len(api_key) >= 4 else "   API key: [too short]")
         
         # Configure the API key
         genai.configure(api_key=api_key)
@@ -607,7 +607,7 @@ def test_all_api_keys() -> dict:
     for idx, key in enumerate(keys):
         key_result = {
             "index": idx + 1,
-            "key_prefix": key[:10] + "..." if len(key) > 10 else key,
+            "key_masked": "****" + key[-4:] if len(key) >= 4 else "****",
             "status": "unknown",
             "error": None
         }

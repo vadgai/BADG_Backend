@@ -340,6 +340,12 @@ def _heuristic_signals(
     patient_response: str,
     last_question_text: Optional[str],
 ) -> Dict[str, Any]:
+    # Positive findings are extracted by the LLM (combined call, or the recovery
+    # extractor when it fails), which normalizes to clean clinical terms. The
+    # deterministic heuristic deliberately does NOT guess positives from question
+    # topics — doing so previously polluted the symptom list with question-stem
+    # fragments (e.g. "you wake up at night due to symptoms"). It handles only
+    # negatives, red flags, and modifiers.
     positives: List[str] = []
     negatives: List[str] = []
     red_flags = _detect_red_flags(patient_response)

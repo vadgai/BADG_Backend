@@ -6,12 +6,12 @@ Builds the follow-up generation prompt with full asked-question context.
 
 from typing import Dict, List
 
-from followup.validators.repetition import extract_asked_questions
+from followup.constants import FOLLOWUP_DIMENSIONS
 
 
 def build_followup_writer_prompt(patient_state: Dict, strategy_hint: str = "") -> str:
     """Build LLM prompt for next follow-up MCQ."""
-    from diagnosis_methods.state_followup import _format_chat_history
+
 
     symptom_state = (
         patient_state.get("symptom_state")
@@ -42,13 +42,13 @@ def build_followup_writer_prompt(patient_state: Dict, strategy_hint: str = "") -
     positives_text = ", ".join(str(s).strip() for s in positives if str(s).strip()) or "None"
     negatives_text = ", ".join(str(s).strip() for s in negatives if str(s).strip()) or "None"
     red_flags_text = ", ".join(str(s).strip() for s in red_flags if str(s).strip()) or "None"
-    full_history_text = _format_chat_history(patient_state)
 
-    asked_all = extract_asked_questions(patient_state)
-    previously_asked_titles = "\n".join(f"- {q}" for q in asked_all) or "None"
-
+    # Compact repetition control: send remaining unasked dimensions, not prior text.
     feature_ids = symptom_state.get("feature_ids_asked") or []
-    features_text = ", ".join(str(f) for f in feature_ids) or "None"
+    covered = {str(f).strip().lower() for f in feature_ids if str(f).strip()}
+    covered_text = ", ".join(sorted(covered)) or "none"
+    remaining = [d for d in FOLLOWUP_DIMENSIONS if d not in covered]
+    remaining_text = ", ".join(remaining) or "any unasked clinical dimension"
 
     chief_complaint = str(patient_state.get("chief_complaint", "")).strip() or positives_text
 
@@ -83,34 +83,22 @@ def build_followup_writer_prompt(patient_state: Dict, strategy_hint: str = "") -
 
     strategy_line = f"\n- Strategist hint: {strategy_hint}" if strategy_hint else ""
 
-    return f"""Clinical diagnostician. Ask the SINGLE highest-yield next question to separate the top differential diagnoses.
+    return f"""Clinical diagnostician. Ask the SINGLE highest-yield MCQ to separate the top differentials, like an experienced doctor. JSON only.
 
-PATIENT: {age}/{gender}{bmi_text} | Chief: {chief_complaint}
+PATIENT {age}/{gender}{bmi_text} | Chief: {chief_complaint}
 +Confirmed: {positives_text}
 -Ruled out: {negatives_text}
 Red flags: {red_flags_text}
 Turn {turn_count + 1}/12{summary_text}{differentiator_text}{strategy_line}
+Differential: {diff_text}
 
-DIFFERENTIAL (current top suspects):
-{diff_text}
+- feature_id = ONE unused dimension from: {remaining_text}
+- Already covered, never re-ask: {covered_text}
+- Probe EXACTLY ONE dimension: A-D are mutually-exclusive ANSWERS to that single question (levels/variants), NOT a list of different symptoms — never bundle multiple topics. E = "Not sure / None of these".
+- Split Suspect #1 vs #2. Prefer still-missing high-yield axes first (duration/onset, red-flag, severity). Use age/sex for demographic-specific dimensions. Stay in the most likely body system unless a red flag forces otherwise. 5-10 words.
 
-ALREADY ASKED — never repeat or paraphrase (text or clinical dimension):
-{previously_asked_titles}
+EARLY STOP: if turn >= 12 OR top suspect is High-confidence with key differentiators answered → return {{"ready_for_diagnosis": true}}
 
-CLINICAL DIMENSIONS ALREADY COVERED (do not re-ask):
-{features_text}
-
-CONVERSATION:
-{full_history_text}
-
-SELECT NEXT QUESTION:
-1. Target the one feature that best splits Suspect #1 vs #2. Priority: pathognomonic > red-flag > severity > timing/onset > location.
-2. Must add NEW info not in confirmed/ruled-out lists and not overlapping asked questions or feature dimensions.
-3. Stay within the most likely body system unless a red flag forces otherwise.
-4. 5-10 plain-English words. A-D clinically distinct; E = "Not sure / None of these".
-
-EARLY STOP: if turn >= 12, OR top suspect is High-confidence with key differentiators answered → return {{"ready_for_diagnosis": true}}
-
-Return STRICT JSON only:
-{{"Question":"...","A":"...","B":"...","C":"...","D":"...","E":"Not sure / None of these","feature_id":"snake_case_dimension"}}
+Return JSON only:
+{{"Question":"...","A":"...","B":"...","C":"...","D":"...","E":"Not sure / None of these","feature_id":"<one_unused_dimension>"}}
 """

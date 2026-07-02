@@ -35,7 +35,7 @@ CONTEXT:
 - Patient answer: "{patient_response}"
 
 RULES:
-1. NORMALIZE to concise clinical terms ("weight lost"->"weight loss", "stomach hurts"->"abdominal pain").
+1. NORMALIZE to short clinical terms only ("weight lost"->"weight loss", "stomach hurts"->"abdominal pain"). Never store the question text or a full sentence as a finding.
 2. NEGATIVES: if the patient denies the last question, add its topic to new_negative_findings.
 3. RED FLAGS: capture life-threatening mentions (chest pain, loss of consciousness, severe breathing difficulty, etc.).
 4. MODIFIERS: fill any present among duration, onset, location, quality, severity, aggravating_factors, relieving_factors, associated_symptoms.

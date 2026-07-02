@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     
     # Server Configuration
     host: str = Field(default="0.0.0.0", description="Server host")
-    port: int = Field(default=8000, description="Server port")
+    port: int = Field(default=8080, description="Server port")
     reload: bool = Field(default=False, description="Auto-reload on changes")
     
     # CORS Configuration (comma-separated string in env, list in code)
@@ -40,8 +40,9 @@ class Settings(BaseSettings):
     # Database Configuration (for future use)
     database_url: Optional[str] = Field(default=None, description="Database URL")
     
-    # Security Configuration
-    secret_key: str = Field(default="your-secret-key-change-in-production", description="Secret key")
+    # Security Configuration — secret_key must be supplied via the SECRET_KEY env var.
+    # No insecure default: an empty value here is treated as "unset" by consumers.
+    secret_key: str = Field(default="", description="Secret key (required via SECRET_KEY env var)")
     access_token_expire_minutes: int = Field(default=30, description="Token expiration time")
     
     # Rate Limiting

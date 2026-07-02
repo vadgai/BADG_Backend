@@ -71,7 +71,7 @@ def main():
     
     for key_info in results['keys']:
         status_icon = "✅" if key_info['status'] == 'working' else "❌"
-        print(f"{status_icon} Key #{key_info['index']}: {key_info['key_prefix']}")
+        print(f"{status_icon} Key #{key_info['index']}: {key_info.get('key_masked', '****')}")
         print(f"   Status: {key_info['status'].upper()}")
         
         if key_info['error']:

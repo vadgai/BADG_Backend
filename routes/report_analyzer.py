@@ -396,10 +396,27 @@ async def analyze_report(request: Request, file: UploadFile = File(...)):
     file_content = await file.read()
     if len(file_content) > MAX_FILE_SIZE:
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail=f"File too large. Maximum size: {MAX_FILE_SIZE / 1024 / 1024}MB"
         )
-    
+
+    # Validate the file CONTENT (magic bytes) matches the claimed extension, so a
+    # renamed/mislabeled or polyglot file cannot slip past the extension check.
+    def _matches_magic(content: bytes, ext: str) -> bool:
+        if ext == ".pdf":
+            return content[:5] == b"%PDF-"
+        if ext in (".jpg", ".jpeg"):
+            return content[:3] == b"\xff\xd8\xff"
+        if ext == ".png":
+            return content[:8] == b"\x89PNG\r\n\x1a\n"
+        return False
+
+    if not _matches_magic(file_content, file_ext):
+        raise HTTPException(
+            status_code=400,
+            detail="File content does not match its extension (possible corrupted or mislabeled file).",
+        )
+
     # Reset file pointer
     await file.seek(0)
     

@@ -24,11 +24,11 @@ if errorlevel 1 (
 )
 
 echo.
-echo Starting server on http://0.0.0.0:8000...
-echo WebSocket endpoint: ws://localhost:8000/followup/{session_id}
+echo Starting server on http://0.0.0.0:8080...
+echo WebSocket endpoint: ws://localhost:8080/followup/{session_id}
 echo.
 echo Press Ctrl+C to stop the server
 echo.
 
-uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app:app --host 0.0.0.0 --port 8080 --reload
 

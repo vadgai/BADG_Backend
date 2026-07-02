@@ -52,13 +52,13 @@ echo.
 echo [SUCCESS] Starting VADG backend server...
 echo.
 echo Server will be available at:
-echo   - API: http://localhost:8000
-echo   - Docs: http://localhost:8000/docs
-echo   - WebSocket: ws://localhost:8000/followup/{session_id}
+echo   - API: http://localhost:8080
+echo   - Docs: http://localhost:8080/docs
+echo   - WebSocket: ws://localhost:8080/followup/{session_id}
 echo.
 echo Press Ctrl+C to stop the server
 echo.
 
 REM Start the server
-uvicorn app:app --reload --host 0.0.0.0 --port 8000
+uvicorn app:app --reload --host 0.0.0.0 --port 8080
 
