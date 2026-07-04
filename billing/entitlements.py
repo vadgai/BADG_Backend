@@ -73,7 +73,17 @@ async def _usage_by_session(session_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def _record_usage(user: Dict[str, Any], session_id: str, source: str, disease: Optional[str]) -> None:
+async def _record_usage(user: Dict[str, Any], session_id: str, source: str, disease: Optional[str]) -> bool:
+    """
+    Atomically claim `session_id` for a usage record.
+
+    Backed by a unique index on report_usage.session_id, so under a race
+    (double-click, retry, two tabs hitting /generate_report for the same
+    session at once) exactly one caller's upsert actually inserts — every
+    other caller sees the doc already exists and gets False back. Callers
+    must only decrement a balance when this returns True, which is what makes
+    "consume after success" safe against duplicate deductions.
+    """
     doc = {
         "user_id": str(user["_id"]),
         "user_email": user.get("email"),
@@ -85,14 +95,18 @@ async def _record_usage(user: Dict[str, Any], session_id: str, source: str, dise
     col = _usage_collection()
     if col is not None:
         try:
-            # Upsert on session_id keeps it idempotent even under races.
-            await col.update_one({"session_id": session_id}, {"$setOnInsert": doc}, upsert=True)
+            result = await col.update_one({"session_id": session_id}, {"$setOnInsert": doc}, upsert=True)
+            return result.upserted_id is not None
         except Exception as e:
+            # Duplicate-key (lost the race) or any other DB error — fail safe
+            # by treating it as "not claimed" rather than risk double-charging.
             logger.error("Failed to record report usage: %s", e)
-        return
-    if not any(r.get("session_id") == session_id for r in _mem_usage):
-        doc["_id"] = uuid.uuid4().hex
-        _mem_usage.append(doc)
+            return False
+    if any(r.get("session_id") == session_id for r in _mem_usage):
+        return False
+    doc["_id"] = uuid.uuid4().hex
+    _mem_usage.append(doc)
+    return True
 
 
 async def enrich_usage(
@@ -214,9 +228,16 @@ async def check_and_consume(
     user: Dict[str, Any], session_id: str, disease: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Attempt to unlock a report for `session_id`.
+    Attempt to unlock a report for `session_id` — call this ONLY after the
+    report has actually been generated, never before, so a failed/interrupted
+    generation never costs a credit.
+
     Returns {"allowed": bool, "source": str, "reason": str, "balance": {...}}.
-    Idempotent: an already-unlocked session is always allowed without charge.
+    Idempotent and race-safe: an already-unlocked session is always allowed
+    without charge, and concurrent calls for the same session_id (double
+    submit, retry, two tabs) can only ever decrement the balance once — the
+    balance is only touched after this session_id is atomically claimed via
+    _record_usage, which is backed by a unique index.
     """
     uid = str(user["_id"])
 
@@ -225,7 +246,8 @@ async def check_and_consume(
         return {"allowed": True, "source": existing.get("source", "credit"), "already_unlocked": True,
                 "balance": get_balance(user)}
 
-    # Admins: unlimited (still logged for activity monitoring).
+    # Admins: unlimited (still logged for activity monitoring). No balance to
+    # protect, so a lost claim race here is harmless — just skip the duplicate.
     if user.get("role") == "admin":
         await _record_usage(user, session_id, "admin", disease)
         return {"allowed": True, "source": "admin", "balance": get_balance(user)}
@@ -236,12 +258,15 @@ async def check_and_consume(
 
     # 1) Daily free allowance
     if free_used < FREE_REPORTS_PER_DAY:
+        # Claim the session BEFORE touching the balance — only the winner of
+        # this atomic insert may decrement it.
+        if not await _record_usage(user, session_id, "free", disease):
+            return {"allowed": True, "already_unlocked": True, "balance": get_balance(user)}
         await user_service.update_user(uid, {
             "free_report_date": today,
             "free_report_count": free_used + 1,
             "total_reports": total + 1,
         })
-        await _record_usage(user, session_id, "free", disease)
         user["free_report_date"] = today
         user["free_report_count"] = free_used + 1
         user["total_reports"] = total + 1
@@ -250,11 +275,12 @@ async def check_and_consume(
     # 2) Paid credits
     credits = int(user.get("report_credits", 0) or 0)
     if credits > 0:
+        if not await _record_usage(user, session_id, "credit", disease):
+            return {"allowed": True, "already_unlocked": True, "balance": get_balance(user)}
         await user_service.update_user(uid, {
             "report_credits": credits - 1,
             "total_reports": total + 1,
         })
-        await _record_usage(user, session_id, "credit", disease)
         user["report_credits"] = credits - 1
         user["total_reports"] = total + 1
         return {"allowed": True, "source": "credit", "balance": get_balance(user)}

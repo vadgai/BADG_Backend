@@ -31,7 +31,7 @@ def phase1_module_and_strategist():
     from followup.feature_tracking import record_sent_question, is_feature_already_asked
     from followup.agents.strategist import plan_next_question, build_strategy_context
 
-    check("constants loaded", MIN_FOLLOWUP_QUESTIONS == 4 and MAX_FOLLOWUP_QUESTIONS == 12)
+    check("constants loaded", MIN_FOLLOWUP_QUESTIONS == 4 and MAX_FOLLOWUP_QUESTIONS == 10)
     check("Jaccard threshold", JACCARD_REPEAT_THRESHOLD == 0.72)
 
     ss = {"questions_asked": [], "feature_ids_asked": []}

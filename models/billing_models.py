@@ -4,7 +4,7 @@ Billing & pricing models for VADG.
 Credit-based model:
   - Every registered user gets FREE_REPORTS_PER_DAY free diagnosis reports/day.
   - Beyond that, each report consumes 1 non-expiring credit.
-  - Credits are bought pay-as-you-go (₹29/report) or in packs (₹399→12, ₹599→25).
+  - Credits are bought pay-as-you-go (₹29/report) or in packs (₹399→15, ₹599→25).
   - Admin accounts have unlimited reports.
 
 Collections: pricing_plans, payments, report_usage. Entitlement state lives on
@@ -107,8 +107,8 @@ class BalanceResponse(BaseModel):
 class PurchaseRequest(BaseModel):
     plan_id: Optional[str] = None
     plan_code: Optional[str] = None
-    # Manual-payment details the user submits with their request (UPI/UTR ref etc.)
-    payment_reference: Optional[str] = Field(None, max_length=120)
+    # Optional contact number so our team can reach the user about their request.
+    phone: Optional[str] = Field(None, max_length=20)
     note: Optional[str] = Field(None, max_length=400)
 
 
@@ -144,6 +144,7 @@ class PaymentPublic(BaseModel):
     order_id: Optional[str] = None
     provider_payment_id: Optional[str] = None
     payment_reference: Optional[str] = None
+    phone: Optional[str] = None
     note: Optional[str] = None
     reviewed_by: Optional[str] = None
     created_at: Optional[datetime] = None
@@ -164,6 +165,7 @@ class PaymentPublic(BaseModel):
             order_id=doc.get("order_id"),
             provider_payment_id=doc.get("provider_payment_id"),
             payment_reference=doc.get("payment_reference"),
+            phone=doc.get("phone"),
             note=doc.get("note"),
             reviewed_by=doc.get("reviewed_by"),
             created_at=doc.get("created_at"),

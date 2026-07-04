@@ -9,7 +9,7 @@ and an admin management dashboard.
 |------|-------|---------|-------|
 | Free | ₹0 | **1 / day** per registered user | Resets daily. Configurable via `FREE_REPORTS_PER_DAY`. |
 | Pay As You Go (`payg`) | ₹29 | 1 credit | For an extra report after the daily free one. |
-| Standard Pack (`pack12`) | ₹399 | 12 credits | Featured. |
+| Standard Pack (`pack12`) | ₹399 | 15 credits | Featured. |
 | Premium Pack (`pack25`) | ₹599 | 25 credits | Best value. |
 
 - **Credits never expire** and stack on top of the daily free report.

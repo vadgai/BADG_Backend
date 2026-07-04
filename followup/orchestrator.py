@@ -6,6 +6,7 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, Tuple, Union
 
+from followup.constants import MAX_FOLLOWUP_QUESTIONS, MIN_FOLLOWUP_QUESTIONS
 from followup.agents.strategist import build_strategy_context, plan_next_question
 from followup.agents.writer import build_followup_writer_prompt
 from followup.agents.critic import QuestionCritic
@@ -100,7 +101,7 @@ def get_next_followup_question(
 
     patient_state.setdefault("chat_history", [])
     turn_count = int(patient_state.get("turn_count", 0) or 0)
-    if turn_count >= 12:
+    if turn_count >= MAX_FOLLOWUP_QUESTIONS:
         return "Ready for diagnosis"
 
     # ── Fast-path: use pre-generated question from combined call ─────────────
@@ -108,7 +109,7 @@ def get_next_followup_question(
     if isinstance(pending, dict) and pending.get("Question"):
         # Check early-stop flag first (shouldn't appear here but guard anyway)
         if bool(pending.get("ready_for_diagnosis")):
-            if turn_count >= 4:  # respect MIN_FOLLOWUP_QUESTIONS
+            if turn_count >= MIN_FOLLOWUP_QUESTIONS:
                 return "Ready for diagnosis"
         else:
             # Validate through the full critic chain before trusting the LLM

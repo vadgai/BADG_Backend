@@ -33,7 +33,7 @@ COLLECTION = "pricing_plans"
 _mem_plans: Dict[str, Dict[str, Any]] = {}
 
 # Default catalogue — matches the product pricing:
-#   free 1/day (handled by entitlements, not a plan), ₹29/report, ₹399→12, ₹599→25.
+#   free 1/day (handled by entitlements, not a plan), ₹29/report, ₹399→15, ₹599→25.
 DEFAULT_PLANS: List[Dict[str, Any]] = [
     {
         "code": "payg",
@@ -49,9 +49,9 @@ DEFAULT_PLANS: List[Dict[str, Any]] = [
     {
         "code": "pack12",
         "name": "Standard Pack",
-        "description": "12 diagnosis reports. Best for regular check-ins.",
+        "description": "15 diagnosis reports. Best for regular check-ins.",
         "price_inr": 399,
-        "credits": 12,
+        "credits": 15,
         "type": "pack",
         "is_active": True,
         "sort_order": 2,

@@ -35,6 +35,76 @@ def _ensure_profiles_loaded() -> None:
     _PROFILES_READY = True
 
 
+def _anchor_topk_to_posterior(
+    result: Dict[str, Any],
+    belief: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Force the report's top-2 to respect the belief-state posterior.
+
+    The LLM re-ranker refines wording/specificity and #3, but it must not
+    reorder the top-2 or float a low-posterior / out-of-pool disease into #2.
+    The belief posterior already weighs every positive, negative, duration and
+    demographic prior, so it is authoritative for ordering. We keep the LLM's
+    name, reasoning and urgency but:
+      - sort in-pool conditions (those matching a posterior entry) by posterior,
+      - push out-of-pool conditions below them (they can never be #1/#2 when
+        >=2 in-pool conditions exist),
+      - re-band probability from posterior (High>=0.5 / Moderate>=0.25 / Low)
+        with a monotonic ceiling so confidence matches rank.
+    """
+    if not isinstance(result, dict) or not isinstance(belief, dict):
+        return result
+    posterior = belief.get("posterior") if isinstance(belief.get("posterior"), dict) else {}
+    conds = result.get("conditions")
+    if not posterior or not isinstance(conds, list) or len(conds) < 2:
+        return result
+
+    try:
+        from followup.information_gain import _core_names_related
+    except Exception:
+        return result
+
+    post_items = list(posterior.items())
+
+    def _posterior_for(name: str) -> float:
+        n = str(name or "").strip().lower()
+        if not n:
+            return -1.0
+        best = -1.0
+        for pname, pval in post_items:
+            if n == str(pname).strip().lower() or _core_names_related(n, str(pname)):
+                try:
+                    best = max(best, float(pval))
+                except (TypeError, ValueError):
+                    continue
+        return best
+
+    annotated = [(_posterior_for(c.get("name", "")), i, c) for i, c in enumerate(conds)]
+    in_pool = sorted((a for a in annotated if a[0] >= 0.0), key=lambda a: (-a[0], a[1]))
+    out_pool = [a for a in annotated if a[0] < 0.0]
+    ordered = [a for a in in_pool] + [a for a in out_pool]
+
+    band_name = {2: "High", 1: "Moderate", 0: "Low"}
+    band_level = {"high": 2, "moderate": 1, "low": 0}
+    ceiling = 2
+    reordered: List[Dict[str, Any]] = []
+    for post, _idx, cond in ordered[:3]:
+        cond = dict(cond)
+        if post >= 0.0:  # in-pool → band by posterior, monotonic down the list
+            raw = 2 if post >= 0.50 else 1 if post >= 0.25 else 0
+            cond["posterior"] = round(post, 3)
+        else:  # out-of-pool #3 → keep the LLM band but cap it monotonically
+            raw = band_level.get(str(cond.get("probability", "Low")).strip().lower(), 0)
+        raw = min(raw, ceiling)
+        ceiling = raw
+        cond["probability"] = band_name[raw]
+        reordered.append(cond)
+
+    result = dict(result)
+    result["conditions"] = reordered
+    return result
+
+
 def _format_chat_history(chat_history) -> str:
     if not chat_history:
         return "No previous questions asked."
@@ -351,6 +421,7 @@ TASK:
 2) Allow an out-of-pool condition ONLY if explicitly supported by positives/modifiers/red flags and not contradicted by negatives.
 3) Per condition: probability (High/Moderate/Low), 1-2 sentence reasoning anchored to (+)/(-)/modifiers/red flags and consistent with the probability, urgency (Emergency/Routine/Monitor).
 4) Use the Q&A history for refinement (exact wording, negatives, progression).
+5) Name the MOST SPECIFIC diagnosis the evidence supports, never a broad category (e.g. "Pulmonary tuberculosis" not "Respiratory infection"; "Acute appendicitis" not "Abdominal pathology").
 
 Return JSON only:
 {{
@@ -482,6 +553,9 @@ def get_final_diagnosis_v5(
         if rejected_out_of_pool and isinstance(patient_state, dict):
             counters = patient_state.setdefault("diagnostic_counters", {})
             counters["out_of_pool_llm_suggestion_rejections"] = int(counters.get("out_of_pool_llm_suggestion_rejections", 0) or 0) + len(rejected_out_of_pool)
+        # Anchor the final top-2 to the belief posterior so the LLM cannot float a
+        # low-posterior / out-of-pool disease into the #2 slot.
+        normalized = _anchor_topk_to_posterior(normalized, belief)
         return normalized
     except Exception as exc:
         logger.warning("get_final_diagnosis_v5: error: %s", exc)

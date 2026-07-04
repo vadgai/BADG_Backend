@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -150,11 +151,55 @@ _CLINICAL_SYNONYMS: Dict[str, List[str]] = {
     "high temperature": ["fever"],
     "running fever": ["fever"],
     "feeling hot": ["fever"],
+    # Layperson ↔ clinical bridges: follow-up questions are phrased in plain
+    # language, so patient positives/negatives arrive as everyday words while
+    # disease profiles use clinical terms. Without these, a denial like
+    # "no burning chest" never matches GERD's "heartburn" and has zero effect.
+    "burning chest": ["heartburn"],
+    "chest burning": ["heartburn"],
+    "burning in chest": ["heartburn"],
+    "acid taste": ["regurgitation", "heartburn"],
+    "sour taste": ["regurgitation", "heartburn"],
+    "acid reflux": ["heartburn", "regurgitation"],
+    "food coming back up": ["regurgitation"],
+    "throwing up": ["vomiting"],
+    "threw up": ["vomiting"],
+    "puking": ["vomiting"],
+    "phlegm": ["sputum"],
+    "mucus": ["sputum"],
+    "coughing up blood": ["hemoptysis"],
+    "blood in phlegm": ["hemoptysis"],
+    "blood in sputum": ["hemoptysis"],
+    "blood in cough": ["hemoptysis"],
+    "short of breath": ["shortness of breath", "difficulty breathing", "dyspnea"],
+    "breathless": ["shortness of breath", "difficulty breathing", "dyspnea"],
+    "breathlessness": ["shortness of breath", "difficulty breathing", "dyspnea"],
+    "shortness of breath": ["dyspnea", "difficulty breathing"],
+    "wheezing": ["wheeze"],
+    "whistling breathing": ["wheeze", "wheezing"],
+    "sweating at night": ["night sweats"],
+    "night sweating": ["night sweats"],
+    "no appetite": ["loss of appetite", "anorexia"],
+    "poor appetite": ["loss of appetite", "anorexia"],
+    "not hungry": ["loss of appetite"],
+    "tiredness": ["fatigue"],
+    "exhausted": ["fatigue"],
+    "very tired": ["fatigue"],
+    "yellow skin": ["jaundice"],
+    "yellow eyes": ["jaundice"],
+    "yellowing": ["jaundice"],
+    "swollen glands": ["lymphadenopathy", "swollen lymph nodes"],
+    "swollen nodes": ["lymphadenopathy", "swollen lymph nodes"],
 }
 
 
-def _expand_synonyms(term: str) -> List[str]:
-    """Expand a normalized term to include all known synonyms."""
+@lru_cache(maxsize=4096)
+def _expand_synonyms(term: str) -> Tuple[str, ...]:
+    """Expand a normalized term to include all known synonyms.
+
+    Cached: called for every feature of every disease on each analyze_case
+    pass, but the distinct term vocabulary is small.
+    """
     expansions = [term]
     lower_term = term.strip().lower()
     if lower_term in _CLINICAL_SYNONYMS:
@@ -163,7 +208,7 @@ def _expand_synonyms(term: str) -> List[str]:
     for key, values in _CLINICAL_SYNONYMS.items():
         if key in lower_term or lower_term in key:
             expansions.extend(values)
-    return list(dict.fromkeys(expansions))  # deduplicate preserving order
+    return tuple(dict.fromkeys(expansions))  # deduplicate preserving order
 
 
 def _tokenize(value: Any) -> List[str]:
@@ -511,6 +556,7 @@ def score_disease_match(
 
     key_feature_count = 0
     matched_key_count = 0
+    denied_key_count = 0
     feature_buckets = [
         ("key", 1.25, 0.95),
         ("supportive", 0.75, 0.55),
@@ -538,12 +584,15 @@ def score_disease_match(
             if _feature_match(term, negatives_norm):
                 contradiction_penalty += (neg_factor * weight_value)
                 details["contradicted_features"].append(term)
+                if bucket_name == "key":
+                    denied_key_count += 1
 
     # Coverage of the disease's own key (defining) features by the patient's positives.
     # Used to gate high-confidence labels so a single incidental match cannot read "High".
     details["matched_key_count"] = matched_key_count
     details["key_feature_count"] = key_feature_count
     details["key_coverage"] = round(matched_key_count / key_feature_count, 3) if key_feature_count else 0.0
+    details["denied_key_count"] = denied_key_count
 
     for feature in disease_profile.get("features", {}).get("exclude", []):
         term = _normalize_text(feature.get("term"))
@@ -622,6 +671,16 @@ def score_disease_match(
         score *= 0.35
     if details["exclude_hits"] and len(details["matched_positive_features"]) < 2:
         score *= 0.55
+    # Key-feature denial gate: the additive contradiction_penalty above is
+    # normalized against positive_max, so a disease whose DEFINING features the
+    # patient explicitly denied can still float on tier/urgency bonuses (e.g.
+    # GERD ranking #2 after the patient answered "No" to every reflux question).
+    # Denying the majority of a disease's key features must collapse its score.
+    if key_feature_count:
+        if denied_key_count >= key_feature_count:
+            score *= 0.15
+        elif denied_key_count / key_feature_count >= 0.5:
+            score *= 0.40
     score = min(1.0, max(0.0, score))
     details["final_numeric_score"] = round(score, 4)
 

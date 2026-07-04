@@ -21,8 +21,16 @@ from followup.session_helpers import (
     sync_structured_state,
     update_last_trace_after_answer,
 )
+from database.session_persistence import get_or_restore_session, save_session
+from symptom_card import apply_symptom_card, generate_symptom_card
 
 logger = logging.getLogger("uvicorn.error")
+
+# The mid-questionnaire symptom card IS question #7 of the 10-question flow:
+# MCQs 1-6, symptom card, MCQs 8-10. It triggers once the patient has answered
+# question 6 and draws from the current top-4 differential, so its selections
+# directly shape questions 8-10.
+MIDPOINT_CARD_AFTER_QUESTION = 6
 
 
 async def handle_followup_websocket(
@@ -39,12 +47,11 @@ async def handle_followup_websocket(
         await websocket.accept()
         logger.info("WebSocket accepted for session %s", session_id)
 
-        if session_id not in session_store:
+        session = await get_or_restore_session(session_id, session_store)
+        if session is None:
             await websocket.send_json({"error": "Invalid session_id"})
             await websocket.close(code=1008, reason="Invalid session_id")
             return
-
-        session = session_store[session_id]
         age = session.get("age")
         gender = session.get("gender")
         symptoms = session.get("symptoms") or []
@@ -124,7 +131,75 @@ async def handle_followup_websocket(
             if isinstance(trace_turn, dict):
                 payload["diagnostic_trace_turn"] = trace_turn
 
+            # Persist before sending: a reconnect may land on another Cloud Run instance.
+            await save_session(session_id, session)
+
             await websocket.send_json(payload)
+            return True
+
+        async def offer_midpoint_card() -> bool:
+            """Push the Q7 mid-questionnaire symptom card and block for its reply.
+
+            Built from the current top-4 differential's highest-information-gain
+            symptoms (no condition names ever leave the server). Returns False if
+            the socket disconnects while waiting, so the caller can bail out.
+            """
+            card = await run_blocking(generate_symptom_card, patient_state, "midpoint")
+            if not (isinstance(card, dict) and (card.get("symptoms") or card.get("clinical_factors"))):
+                # Nothing to offer — don't consume question slot #7, keep MCQs flowing.
+                session["midpoint_card_shown"] = True
+                return True
+
+            await websocket.send_json({
+                "type": "symptom_card",
+                "stage": "midpoint",
+                "question_number": MIDPOINT_CARD_AFTER_QUESTION + 1,
+                "card": card,
+            })
+
+            while True:
+                try:
+                    card_msg = await websocket.receive_text()
+                except WebSocketDisconnect:
+                    logger.info("Session %s disconnected while awaiting midpoint symptom card.", session_id)
+                    return False
+                except Exception as exc:
+                    logger.exception("Receive error awaiting midpoint card session=%s: %s", session_id, exc)
+                    return False
+
+                try:
+                    card_data = json.loads(card_msg)
+                except json.JSONDecodeError:
+                    card_data = None
+
+                if isinstance(card_data, dict) and card_data.get("type") == "ping":
+                    await websocket.send_json({"type": "pong"})
+                    continue
+
+                if isinstance(card_data, dict) and card_data.get("type") == "symptom_card_submit":
+                    try:
+                        # Mutates patient_state in place and returns the same dict.
+                        await run_blocking(
+                            apply_symptom_card,
+                            patient_state,
+                            card_data.get("offered") or [],
+                            card_data.get("selected") or [],
+                            card_data.get("factors") or {},
+                        )
+                        merged_symptom_state = patient_state.get("symptom_state")
+                        if isinstance(merged_symptom_state, dict):
+                            symptom_state.update(merged_symptom_state)
+                        sync_structured_state(session, patient_state, symptom_state)
+                        await save_session(session_id, session)
+                    except Exception as exc:
+                        logger.warning("apply_symptom_card (midpoint) failed session=%s: %s", session_id, exc)
+                # Any non-ping reply (submit or skip) ends the wait — fail open.
+                break
+
+            # The card consumed question slot #7 — the next MCQ is #8.
+            session["midpoint_card_shown"] = True
+            session["question_count"] = MIDPOINT_CARD_AFTER_QUESTION + 1
+            await save_session(session_id, session)
             return True
 
         if session.get("question_count", 0) == 0:
@@ -190,6 +265,7 @@ async def handle_followup_websocket(
                     if isinstance(signals, dict):
                         update_last_trace_after_answer(patient_state, signals)
                 sync_structured_state(session, patient_state, symptom_state)
+                await save_session(session_id, session)
             except Exception as exc:
                 logger.warning("update_state_with_answer failed session=%s: %s", session_id, exc)
 
@@ -201,6 +277,12 @@ async def handle_followup_websocket(
                 })
                 await websocket.close(code=1000, reason="Max questions reached")
                 break
+
+            if current_count == MIDPOINT_CARD_AFTER_QUESTION and not session.get("midpoint_card_shown"):
+                if not await offer_midpoint_card():
+                    break
+                # Re-read: if the card was shown it took slot #7, so the next MCQ is #8.
+                current_count = session.get("question_count", current_count)
 
             try:
                 next_raw = await run_blocking(get_next_followup_question, patient_state, 1)

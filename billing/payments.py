@@ -66,7 +66,7 @@ def _to_oid(pid: str):
 async def create_order(
     user: Dict[str, Any], plan: Dict[str, Any],
     payment_reference: Optional[str] = None, note: Optional[str] = None,
-    status: str = "pending", auto_paid: bool = False,
+    status: str = "pending", auto_paid: bool = False, phone: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a payment record for `plan` and return the order descriptor.
 
@@ -90,6 +90,7 @@ async def create_order(
         "provider_order_id": None,
         "provider_payment_id": None,
         "payment_reference": (payment_reference or "").strip() or None,
+        "phone": (phone or "").strip() or user.get("phone") or None,
         "note": (note or "").strip() or None,
         "reviewed_by": None,
         "created_at": now,

@@ -37,9 +37,9 @@ PAYMENT_UPI_ID = os.getenv("PAYMENT_UPI_ID", "")
 PAYMENT_PAYEE_NAME = os.getenv("PAYMENT_PAYEE_NAME", "VADG")
 PAYMENT_INSTRUCTIONS = os.getenv(
     "PAYMENT_INSTRUCTIONS",
-    "Pay the plan amount to the UPI ID above, then submit your UPI/UTR reference "
-    "below. Your report credits are activated by our team after the payment is "
-    "verified — usually within a few hours.",
+    "Pay the plan amount to the UPI ID above, then submit your request below. "
+    "Our team will reach out to verify your payment and activate your report "
+    "credits — usually within a few hours.",
 )
 
 
@@ -130,7 +130,7 @@ async def purchase(req: PurchaseRequest, user: dict = Depends(get_current_user))
         raise HTTPException(status_code=400, detail="This plan is no longer available")
 
     order = await payments.create_order(
-        user, plan, payment_reference=req.payment_reference, note=req.note, status="pending",
+        user, plan, note=req.note, status="pending", phone=req.phone,
     )
 
     # Notify the admin (to verify) and acknowledge to the user (best-effort).
@@ -138,7 +138,7 @@ async def purchase(req: PurchaseRequest, user: dict = Depends(get_current_user))
         await email_service.send_admin_purchase_request(
             user.get("name", ""), user.get("email", ""), order["plan_name"],
             order["amount_inr"], order["credits"], order["order_id"],
-            payment_reference=req.payment_reference or "", note=req.note or "",
+            phone=order.get("phone") or "", note=req.note or "",
         )
     except Exception as e:
         logger.error("Admin purchase-request notification failed: %s", e)

@@ -1,18 +1,24 @@
 """
-Symptom selection cards that bracket the follow-up questionnaire.
+Symptom selection cards shown before, during, and after the follow-up questionnaire.
 
 Card 1 (stage="initial"): from the top-5 rule-engine candidates for the patient's
 initial symptoms, surface the 7-10 highest-information-gain symptoms the patient
 has NOT mentioned, plus key clinical-history factors (duration, smoking, alcohol,
 past medical history, family history). The user multi-selects before follow-up.
 
-Card 2 (stage="refined"): after the 12 follow-up questions, from the top-3
-candidates, surface a second discriminating symptom set to confirm the narrowed
-picture before the final 2-diagnosis analysis.
+Card 2 (stage="midpoint"): IS question #7 of the 10-question flow (MCQs 1-6,
+card, MCQs 8-10). From the current top-4 candidates, surface the symptoms with
+the highest expected information gain — the ones that best differentiate between
+the leading conditions. Never carries condition/disease names to the client,
+only symptom labels; the selections feed directly into questions 8-10.
+
+Card 3 (stage="refined"): after question 10, from the top-3 candidates, surface
+a final discriminating symptom set to confirm the narrowed picture before the
+final 2-diagnosis analysis.
 
 Selections merge into patient_state (selected -> positives, offered-but-unselected
 -> negatives), so they flow into the existing rule-engine + report pipeline. Uses
-the information-gain ranker so the card offers the MOST discriminating symptoms,
+the information-gain ranker so each card offers the MOST discriminating symptoms,
 not arbitrary ones.
 """
 
@@ -56,6 +62,7 @@ _DEFAULT_HISTORY = {"pmh": ["Diabetes", "Hypertension", "Cancer", "Past TB"],
 
 _STAGE_CONFIG = {
     "initial": {"top_k": 5, "limit": 10, "with_factors": True},
+    "midpoint": {"top_k": 4, "limit": 8, "with_factors": False},
     "refined": {"top_k": 3, "limit": 8, "with_factors": False},
 }
 
@@ -67,10 +74,93 @@ _SYMPTOM_SYNONYMS = {"discomfort": "pain", "ache": "pain", "aches": "pain", "sor
 _SYMPTOM_STOP = {"of", "the", "a", "an", "and", "or", "with", "in", "on", "to", "mild", "new", "recent"}
 _SYMPTOM_GENERIC = {"pain", "symptoms", "symptom", "malaise", "unwell", "illness", "feeling", "problem"}
 
+# Lab/exam/imaging findings a PATIENT cannot self-report. These leak onto the
+# card straight from disease profiles ("eosinophilia", "crackles", "raised IgE")
+# and are useless — even harmful — on a patient-facing symptom-selection card.
+# Any label containing one of these tokens is dropped entirely.
+_NON_PATIENT_OBSERVABLE = {
+    "eosinophilia", "eosinophil", "ige", "igm", "igg", "leukocytosis", "leucocytosis",
+    "neutrophilia", "lymphocytosis", "thrombocytopenia", "anemia", "anaemia",
+    "crackles", "rales", "rhonchi", "crepitations",  # auscultation signs
+    "consolidation", "infiltrate", "infiltrates", "opacity",
+    "effusion", "cardiomegaly", "hepatomegaly", "splenomegaly",
+    "esr", "crp", "wbc", "rbc", "creatinine", "bilirubin", "elevated", "raised",
+    "positive", "titre", "titer", "serology", "antibody", "antigen", "culture",
+    "radiograph", "xray", "x-ray", "ct", "mri", "ultrasound", "biopsy", "ecg", "ekg",
+    "bruit", "murmur", "gallop", "clubbing", "icterus",
+    "tenderness", "guarding", "rigidity", "hepatojugular", "ascites",
+}
+
+# Clinical term → plain patient-facing wording for card labels. Applied after the
+# blocklist, before title-casing, so the user reads everyday language.
+_PLAIN_LABEL = {
+    "dyspnea": "shortness of breath",
+    "worsening dyspnea": "worsening shortness of breath",
+    "severe dyspnea": "severe shortness of breath",
+    "exertional dyspnea": "breathless with activity",
+    "orthopnea": "breathless lying flat",
+    "paroxysmal nocturnal dyspnea": "waking up breathless at night",
+    "hemoptysis": "coughing up blood",
+    "sputum production": "coughing up phlegm",
+    "purulent sputum": "coloured phlegm",
+    "productive cough": "cough with phlegm",
+    "night cough": "cough at night",
+    "nocturnal cough": "cough at night",
+    "coryza": "runny nose",
+    "rhinorrhea": "runny nose",
+    "epistaxis": "nosebleed",
+    "dysphagia": "trouble swallowing",
+    "odynophagia": "painful swallowing",
+    "heartburn": "burning in the chest",
+    "regurgitation": "food or acid coming back up",
+    "epigastric pain": "upper-tummy pain",
+    "dyspepsia": "indigestion",
+    "hematemesis": "vomiting blood",
+    "melena": "black stools",
+    "hematochezia": "blood in stools",
+    "hematuria": "blood in urine",
+    "dysuria": "burning when passing urine",
+    "polyuria": "passing urine often",
+    "nocturia": "passing urine at night",
+    "jaundice": "yellow skin or eyes",
+    "pruritus": "itching",
+    "myalgia": "muscle aches",
+    "arthralgia": "joint pain",
+    "vertigo": "spinning dizziness",
+    "syncope": "fainting",
+    "palpitations": "heart racing",
+    "diaphoresis": "sweating",
+    "night sweats": "sweating at night",
+    "anorexia": "loss of appetite",
+    "malaise": "feeling generally unwell",
+    "fatigue": "tiredness",
+    "photophobia": "sensitivity to light",
+    "paresthesia": "tingling or numbness",
+    "claudication": "leg pain when walking",
+    "cyanosis": "blue lips or fingertips",
+    "edema": "swelling",
+    "oedema": "swelling",
+    "peripheral edema": "swollen ankles or legs",
+    "pedal edema": "swollen feet or ankles",
+    "pallor": "looking pale",
+}
+
 
 def _title_case(term: str) -> str:
     term = str(term or "").strip()
     return term[:1].upper() + term[1:] if term else term
+
+
+def _plain_label(label: str) -> str:
+    """Map a clinical feature term to plain patient-facing wording."""
+    low = label.strip().lower()
+    if low in _PLAIN_LABEL:
+        return _PLAIN_LABEL[low]
+    # token-level swaps for compound terms (e.g. "acute dyspnea" → "acute shortness of breath")
+    for clin, plain in _PLAIN_LABEL.items():
+        if " " not in clin and clin in re.findall(r"[a-z]+", low):
+            low = re.sub(rf"\b{re.escape(clin)}\b", plain, low)
+    return low
 
 
 def _symptom_signature(label: str) -> frozenset:
@@ -80,12 +170,15 @@ def _symptom_signature(label: str) -> frozenset:
 
 
 def _clean_symptoms(findings: List[Dict[str, Any]], limit: int) -> List[Dict[str, str]]:
-    """Dedup near-duplicates (synonym-aware), drop generic/verbose labels."""
+    """Dedup near-duplicates (synonym-aware), drop generic/verbose/non-observable labels."""
     kept: List[Dict[str, str]] = []
     seen: List[frozenset] = []
     for f in findings:
         label = str(f.get("term", "")).strip()
         if not label or len(label.split()) > 5:  # skip verbose descriptive features
+            continue
+        tokens = set(re.findall(r"[a-z0-9]+", label.lower()))
+        if tokens & _NON_PATIENT_OBSERVABLE:  # lab/exam finding, not patient-reportable
             continue
         sig = _symptom_signature(label)
         if not sig or sig <= _SYMPTOM_GENERIC:  # all-generic → skip
@@ -94,7 +187,7 @@ def _clean_symptoms(findings: List[Dict[str, Any]], limit: int) -> List[Dict[str
         if any(sig == s or sig <= s or s <= sig or len(sig & s) / max(1, len(sig | s)) >= 0.6 for s in seen):
             continue
         seen.append(sig)
-        kept.append({"label": _title_case(label), "dimension": str(f.get("dimension", ""))})
+        kept.append({"label": _title_case(_plain_label(label)), "dimension": str(f.get("dimension", ""))})
         if len(kept) >= limit:
             break
     return kept

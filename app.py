@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Union
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -34,6 +34,7 @@ from symptom_card import generate_symptom_card, apply_symptom_card
 
 # Import database and new route modules
 from database.connection import connect_to_mongodb, close_mongodb_connection
+from database.session_persistence import save_session, get_or_restore_session
 from routes import admin, form, contact, report_analyzer, translate, disease_info, analytics, careers
 # NOTE: IndicTrans2 integration disabled - using Google/Gemini instead.
 # The translateProxy / localizedReport route modules were removed as dead code;
@@ -43,8 +44,9 @@ from routes.admin_endpoints import router as admin_endpoints_router
 from routes.admin_insights import router as admin_insights_router
 
 # Billing / entitlements (report limit enforcement)
-from auth.dependencies import get_current_user
+from auth.dependencies import optional_user
 from billing import entitlements as billing_entitlements
+from billing import anon_entitlements
 
 # Import new modules (commented out until modules are created)
 # from models import DiagnosisRequest, DiagnosisResponse, ErrorResponse, HealthCheckResponse
@@ -506,19 +508,36 @@ async def options_symptom():
     return JSONResponse(content={}, status_code=200)
 
 @app.post("/symptom")
-async def submit_symptom(payload: DiagnosisRequest):
+async def submit_symptom(
+    payload: DiagnosisRequest,
+    current_user: Optional[dict] = Depends(optional_user),
+    x_anon_id: Optional[str] = Header(None, alias="X-Anon-Id"),
+):
     """
     Submit patient symptoms for AI analysis with comprehensive error handling.
-    
+
     Args:
         payload: Validated patient data including name, age, gender, and symptoms
-        
+
     Returns:
         Dictionary with session ID and processing status
     """
     try:
+        # Anonymous visitors get exactly one free diagnosis per device. Gate here,
+        # at the very start of the flow, so a second diagnosis never gets past the
+        # patient-details step — the first one is never interrupted mid-flow since
+        # this check only ever runs before a session is created.
+        if not current_user and await anon_entitlements.has_used_free_report(x_anon_id):
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "code": "login_required",
+                    "message": "You've used your free diagnosis. Please log in or create a free account to continue.",
+                },
+            )
+
         # Log the incoming request
-        logger.info("Processing symptom submission: name=%s age=%s gender=%s", 
+        logger.info("Processing symptom submission: name=%s age=%s gender=%s",
                    payload.name, payload.age, payload.gender)
 
         # Normalize and extract symptoms
@@ -595,6 +614,9 @@ async def submit_symptom(payload: DiagnosisRequest):
             "diet_type": payload.diet_type
         }
 
+        # Mirror to MongoDB so other Cloud Run instances (or a restarted one) can serve this session.
+        await save_session(session_id, session_store[session_id])
+
         logger.info("Created session %s for patient %s (age=%s)", session_id, payload.name, payload.age)
 
         return {
@@ -603,10 +625,12 @@ async def submit_symptom(payload: DiagnosisRequest):
             "session_id": session_id
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Unexpected error processing symptom submission: %s", e)
         raise HTTPException(
-            status_code=500, 
+            status_code=500,
             detail="Internal server error processing symptom submission"
         )
 
@@ -623,11 +647,10 @@ async def options_session(session_id: str):  # pylint: disable=unused-argument
 async def get_session_data(session_id: str):
     """Get session data by ID."""
     try:
-        if session_id not in session_store:
+        session = await get_or_restore_session(session_id, session_store)
+        if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
-        
-        session = session_store[session_id]
-        
+
         return {
             "session_id": session_id,
             "name": session.get("name", "Unknown"),
@@ -664,12 +687,12 @@ async def options_symptom_card(session_id: str):  # pylint: disable=unused-argum
 
 @app.get("/symptom_card/{session_id}")
 async def get_symptom_card(session_id: str, stage: str = "initial"):
-    """Generate a symptom-selection card (stage=initial before follow-up, refined after)."""
-    if session_id not in session_store:
+    """Generate a symptom-selection card (initial before follow-up, midpoint at Q7, refined after)."""
+    session = await get_or_restore_session(session_id, session_store)
+    if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    session = session_store[session_id]
     patient_state = session.get("patient_state") if isinstance(session.get("patient_state"), dict) else {}
-    stage = stage if stage in ("initial", "refined") else "initial"
+    stage = stage if stage in ("initial", "midpoint", "refined") else "initial"
     try:
         loop = asyncio.get_event_loop()
         card = await loop.run_in_executor(executor, generate_symptom_card, patient_state, stage)
@@ -687,9 +710,9 @@ async def get_symptom_card(session_id: str, stage: str = "initial"):
 @app.post("/symptom_card/{session_id}")
 async def submit_symptom_card(session_id: str, payload: SymptomCardSubmission):
     """Merge a submitted symptom card into the session's patient_state."""
-    if session_id not in session_store:
+    session = await get_or_restore_session(session_id, session_store)
+    if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    session = session_store[session_id]
     patient_state = session.get("patient_state") if isinstance(session.get("patient_state"), dict) else {}
     try:
         patient_state = apply_symptom_card(
@@ -701,6 +724,7 @@ async def submit_symptom_card(session_id: str, payload: SymptomCardSubmission):
         session["symptoms"] = patient_state.get("identified_symptoms", [])
         session["negatives"] = patient_state.get("negatives", [])
         session["last_activity"] = datetime.utcnow().isoformat()
+        await save_session(session_id, session)
         return {
             "status": "ok",
             "identified_symptoms": patient_state.get("identified_symptoms", []),
@@ -729,13 +753,28 @@ async def options_generate_report(session_id: str):  # pylint: disable=unused-ar
     return JSONResponse(content={}, status_code=200)
 
 @app.get("/generate_report/{session_id}")
-async def generate_report(session_id: str, lang: str = "en", current_user: dict = Depends(get_current_user)):
+async def generate_report(
+    session_id: str,
+    lang: str = "en",
+    current_user: Optional[dict] = Depends(optional_user),
+    x_anon_id: Optional[str] = Header(None, alias="X-Anon-Id"),
+):
     """
     Generate medical report for a session with optional language localization.
 
-    Requires authentication and consumes one report entitlement (the daily free
-    report or a paid credit). Consumption is idempotent per session_id, so
-    re-fetching, exporting, or switching languages for the same diagnosis is free.
+    Logged-in users consume one report entitlement (the daily free report or a
+    paid credit) via billing/entitlements.py. Anonymous visitors get exactly one
+    free report per device (billing/anon_entitlements.py) — the /symptom gate
+    already blocks a second anonymous diagnosis before it starts, this is the
+    defense-in-depth check at generation time.
+
+    Entitlements are only PEEKED here (read-only — fails fast with a clear
+    message before spending an LLM call on someone with nothing left) and
+    actually CONSUMED further below, only once the report has been generated
+    successfully. A failed, interrupted, or cancelled generation never costs a
+    credit. Consumption is idempotent and race-safe per session_id, so
+    re-fetching, exporting, switching languages, or double-submitting the same
+    diagnosis never double-charges.
 
     Args:
         session_id: The session ID
@@ -745,20 +784,31 @@ async def generate_report(session_id: str, lang: str = "en", current_user: dict 
         Report in requested language (localized if lang != "en")
     """
     try:
-        if session_id not in session_store:
+        if await get_or_restore_session(session_id, session_store) is None:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        # --- Enforce report limits (free 1/day, then paid credits) ---------
-        gate = await billing_entitlements.check_and_consume(current_user, session_id)
-        if not gate.get("allowed"):
-            raise HTTPException(
-                status_code=402,
-                detail={
-                    "code": "no_reports_remaining",
-                    "message": "You've used your free report for today. Purchase a plan to generate more.",
-                    "balance": gate.get("balance"),
-                },
-            )
+        if current_user:
+            # --- Peek only: fail fast if nothing is left, don't consume yet ---
+            balance_peek = billing_entitlements.get_balance(current_user)
+            if not balance_peek.get("reports_available"):
+                raise HTTPException(
+                    status_code=402,
+                    detail={
+                        "code": "no_reports_remaining",
+                        "message": "No credits left. Please purchase more credits to generate another diagnosis report.",
+                        "balance": balance_peek,
+                    },
+                )
+        else:
+            # --- Anonymous: peek at the one free report per device -----------
+            if await anon_entitlements.has_used_free_report(x_anon_id):
+                raise HTTPException(
+                    status_code=401,
+                    detail={
+                        "code": "anon_free_report_used",
+                        "message": "You've used your free report. Please log in or create an account to continue.",
+                    },
+                )
 
         session = session_store[session_id]
         name = session.get("name", "Unknown")
@@ -1026,6 +1076,35 @@ async def generate_report(session_id: str, lang: str = "en", current_user: dict 
             # Normalize report structure for frontend/PDF robustness
             report = _normalize_report_for_frontend(report, session, mapped_diseases)
 
+            # --- Consume the entitlement now — only now that the report has ---
+            # actually been generated. Nothing above this point ever deducts, so
+            # an AI-processing failure, a timeout, or the client cancelling the
+            # request never costs the user a credit. Idempotent + race-safe per
+            # session_id (see billing/entitlements.py / anon_entitlements.py).
+            try:
+                if current_user:
+                    gate = await billing_entitlements.check_and_consume(current_user, session_id)
+                    if not gate.get("allowed"):
+                        # Balance was available at the peek above but is gone now
+                        # (e.g. a concurrent request drained the last credit).
+                        # The report is already generated — deliver it rather than
+                        # discard completed work; this is not double-billing since
+                        # nothing was decremented for this call.
+                        logger.warning(
+                            "Report generated for session %s but post-generation credit "
+                            "consumption was denied (user=%s) — delivering anyway.",
+                            session_id, current_user.get("email"),
+                        )
+                else:
+                    if not await anon_entitlements.try_consume(x_anon_id, session_id):
+                        logger.warning(
+                            "Report generated for anonymous session %s but post-generation "
+                            "free-report consumption was denied — delivering anyway.",
+                            session_id,
+                        )
+            except Exception as consume_err:
+                logger.error("Entitlement consumption failed for session %s: %s", session_id, consume_err)
+
             # Record the diagnosis outcome against the user's report history so it
             # shows up in their profile. Best-effort — must never break the report.
             try:
@@ -1084,7 +1163,9 @@ async def generate_report(session_id: str, lang: str = "en", current_user: dict 
             session["report_generated"] = True
             session["report_timestamp"] = datetime.utcnow().isoformat()
             session["report_language"] = lang
-            
+            await save_session(session_id, session)
+
+
             session_location = session.get("location") if isinstance(session.get("location"), dict) else {}
             response_data = {
                 "patient_details": {

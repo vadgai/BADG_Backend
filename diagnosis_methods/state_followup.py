@@ -231,6 +231,15 @@ def _semantic_topic_from_feature(feature: str) -> str:
     return cleaned
 
 
+def _plainify(term: str) -> str:
+    """Map a clinical feature term to plain patient-facing wording (shared map)."""
+    try:
+        from symptom_card import _plain_label
+        return _plain_label(term)
+    except Exception:
+        return str(term or "").strip().lower()
+
+
 def _build_deterministic_question_from_feature(
     feature_term: str,
     opposite_term: str,
@@ -239,14 +248,14 @@ def _build_deterministic_question_from_feature(
 ) -> Dict[str, str]:
     disease_1 = top_two[0] if len(top_two) > 0 else "Top diagnosis"
     disease_2 = top_two[1] if len(top_two) > 1 else "Alternate diagnosis"
-    feature_label = feature_term.strip()
-    opposite_label = opposite_term.strip() if opposite_term else "a different competing pattern"
+    feature_label = _plainify(feature_term)
+    opposite_label = _plainify(opposite_term) if opposite_term else "a different competing pattern"
     return {
-        "Question": f"Which statement best matches your symptoms regarding {feature_label}?",
-        "A": f"Yes, {feature_label} is clearly present",
-        "B": f"No, symptoms are closer to {opposite_label}",
-        "C": "Neither pattern fits clearly",
-        "D": f"I'm not sure about {feature_label}",
+        "Question": f"Do you have {feature_label}?",
+        "A": f"Yes, I have {feature_label}",
+        "B": f"No, it's more like {opposite_label}",
+        "C": "Neither of these fits",
+        "D": f"Not sure about {feature_label}",
         "E": "None of these / Not sure",
         "allow_other": True,
         "priority": priority,
@@ -401,11 +410,11 @@ def _build_chief_symptom_mcq(patient_state: Dict) -> Dict[str, str]:
     lower = chief.lower()
     if any(token in lower for token in {"abdominal", "stomach", "vomit", "diarrhea", "bowel"}):
         return {
-            "Question": "Which digestive pattern best matches your current symptoms?",
-            "A": "Right-lower abdominal pain worsens with movement",
-            "B": "Diffuse abdominal symptoms with loose stools or vomiting",
-            "C": "Upper-abdominal burning discomfort linked to meals",
-            "D": "Bloating or gas mostly after eating",
+            "Question": "Which best describes your stomach symptoms?",
+            "A": "Pain in lower-right belly, worse with movement",
+            "B": "Pain all over belly, with loose motions or vomiting",
+            "C": "Burning pain in upper belly after eating",
+            "D": "Bloating or gas, mostly after eating",
             "E": "None of these / Not sure",
             "allow_other": True,
             "priority": "high",
@@ -417,11 +426,11 @@ def _build_chief_symptom_mcq(patient_state: Dict) -> Dict[str, str]:
 
     if any(token in lower for token in {"cough", "breath", "chest", "wheeze", "phlegm"}):
         return {
-            "Question": "Which respiratory feature is most prominent right now?",
-            "A": "Breathlessness or wheeze episodes with chest tightness",
-            "B": "Productive cough with colored sputum and fever",
-            "C": "Dry cough with throat irritation and minimal sputum",
-            "D": "Chest pain that worsens with deep breathing",
+            "Question": "Which breathing symptom is most noticeable right now?",
+            "A": "Short of breath or wheezing, chest feels tight",
+            "B": "Cough with colored phlegm and fever",
+            "C": "Dry cough with a scratchy throat, little phlegm",
+            "D": "Chest pain that's worse with deep breaths",
             "E": "None of these / Not sure",
             "allow_other": True,
             "priority": "high",
@@ -433,11 +442,11 @@ def _build_chief_symptom_mcq(patient_state: Dict) -> Dict[str, str]:
 
     if any(token in lower for token in {"headache", "dizziness", "weakness", "numb", "balance"}):
         return {
-            "Question": "Which neurological feature best describes your current condition?",
-            "A": "One-sided weakness/numbness or speech disturbance",
-            "B": "Severe throbbing headache with light sensitivity",
-            "C": "Spinning dizziness without focal weakness",
-            "D": "Gradual memory or concentration difficulties",
+            "Question": "Which best describes what you're experiencing?",
+            "A": "Weakness or numbness on one side, or trouble speaking",
+            "B": "Bad throbbing headache with sensitivity to light",
+            "C": "Spinning dizziness, no weakness",
+            "D": "Memory or focus getting worse over time",
             "E": "None of these / Not sure",
             "allow_other": True,
             "priority": "high",
@@ -448,11 +457,11 @@ def _build_chief_symptom_mcq(patient_state: Dict) -> Dict[str, str]:
         }
 
     return {
-        "Question": f"Which associated pattern best matches your current {chief}?",
-        "A": f"Localized and persistent {chief} in one area",
-        "B": f"{chief} with systemic features like fever or fatigue",
-        "C": f"Trigger-linked episodic {chief} that comes and goes",
-        "D": f"{chief} that started suddenly and is severe",
+        "Question": f"Which best matches your {chief}?",
+        "A": f"{chief} stays in one spot, doesn't go away",
+        "B": f"{chief} plus fever or feeling tired/run down",
+        "C": f"{chief} comes and goes, seems triggered by something",
+        "D": f"{chief} started suddenly and is severe",
         "E": "None of these / Not sure",
         "allow_other": True,
         "priority": "high",
@@ -499,7 +508,10 @@ def _build_eig_fallback_mcq(patient_state: Dict) -> Union[Dict, str, None]:
     if not isinstance(ig, dict):
         return None
     if ig.get("ready"):
-        return "Ready for diagnosis"
+        from followup.constants import MIN_FOLLOWUP_QUESTIONS
+        if int(patient_state.get("turn_count", 0) or 0) >= MIN_FOLLOWUP_QUESTIONS:
+            return "Ready for diagnosis"
+        # High confidence but below the question floor — keep asking.
     feature = str(ig.get("feature_term") or "").strip()
     dimension = str(ig.get("dimension") or "").strip()
     if not feature or not dimension:
@@ -507,6 +519,7 @@ def _build_eig_fallback_mcq(patient_state: Dict) -> Union[Dict, str, None]:
     top_two = ig.get("top_two") or []
     d1 = top_two[0] if top_two else "the leading diagnosis"
     d2 = top_two[1] if len(top_two) > 1 else "an alternative"
+    feature = _plainify(feature) or feature
     return {
         "Question": f"Do you have {feature}?",
         "A": f"Yes, {feature}",
@@ -535,7 +548,8 @@ def build_contextual_fallback_mcq(patient_state: Dict) -> Union[Dict, str]:
     turn_count = int(patient_state.get("turn_count", 0) or 0)
     asked_questions = _extract_asked_questions(patient_state)
 
-    if turn_count >= 12:
+    from followup.constants import MAX_FOLLOWUP_QUESTIONS
+    if turn_count >= MAX_FOLLOWUP_QUESTIONS:
         return "Ready for diagnosis"
 
     # 1) Information-gain driven single-dimension question.
@@ -688,13 +702,42 @@ def analyze_answer_for_state(
     # We send short dimension tags instead of the full text of every prior question.
     # The Python critic still enforces no-repeat from symptom_state (Jaccard on
     # questions_asked + feature_id dedup), so this only trims prompt tokens.
-    from followup.constants import FOLLOWUP_DIMENSIONS
+    from followup.constants import (
+        FOLLOWUP_DIMENSIONS,
+        MAX_FOLLOWUP_QUESTIONS,
+        MIN_FOLLOWUP_QUESTIONS,
+    )
 
     feature_ids = symptom_state.get("feature_ids_asked") or []
     covered = {str(f).strip().lower() for f in feature_ids if str(f).strip()}
     covered_text = ", ".join(sorted(covered)) or "none"
     remaining = [d for d in FOLLOWUP_DIMENSIONS if d not in covered]
     remaining_text = ", ".join(remaining) or "any unasked clinical dimension"
+
+    # ── EIG shortlist + posterior anchor (pure computation, zero LLM tokens) ──
+    # Offering the model every unasked dimension invites generic screening
+    # questions; instead offer only the few highest-information-gain dimensions.
+    # The posterior anchor keeps PART 1's differential consistent with the
+    # Bayesian belief state so it cannot drift to diseases whose key symptoms
+    # the patient already denied (e.g. GERD after "No" to all reflux questions).
+    anchor_line = ""
+    try:
+        from followup.information_gain import rank_candidate_findings
+        eig_ranked = rank_candidate_findings(current_state, top_k=6, limit=5)
+    except Exception:
+        eig_ranked = None
+    if isinstance(eig_ranked, dict):
+        eig_findings = eig_ranked.get("findings") or []
+        if eig_findings:
+            remaining_text = ", ".join(
+                f"{f['dimension']} (e.g. {f['term']})" for f in eig_findings[:5]
+            ) + " — ranked by information gain; prefer the first that fits"
+        posterior_map = eig_ranked.get("posterior") or {}
+        if posterior_map:
+            anchor_line = (
+                "\nComputed posterior (rule engine + all evidence so far): "
+                + ", ".join(f"{n} {p:.0%}" for n, p in list(posterior_map.items())[:3])
+            )
 
     # ── Optional contextual lines ───────────────────────────────────────────
     summary_line = f"\nClinical summary so far: {running_summary[:200]}" if running_summary else ""
@@ -709,13 +752,14 @@ PATIENT {age}/{gender}{bmi_text} | Chief: {chief_complaint}
 -Ruled out: {negatives_text}
 Red flags: {red_flags_text}
 Modifiers: {json.dumps(modifier_map, ensure_ascii=False)}
-Turn {turn_count + 1}/12{summary_line}{differentiator_line}{strategy_line}
-Differential: {diff_text}
+Turn {turn_count + 1}/{MAX_FOLLOWUP_QUESTIONS}{summary_line}{differentiator_line}{strategy_line}
+Differential: {diff_text}{anchor_line}
 Latest — Q: {question} | A: {answer}
 
 PART 1 — update state:
 - New findings → identified_symptoms; denied/absent → negatives. Store SHORT clinical terms only — never question text or a sentence. If the answer CONTRADICTS a prior finding (e.g. denies a symptom already in Confirmed), move it to negatives and remove it from findings — never keep both.
-- confidence_score 0-1. Rank EXACTLY 3 differentials (name, confidence High>=70%/Moderate 50-70%/Low<50%, 1-line reasoning tied to findings+negatives). Weigh acuity: chronic course (weeks + weight loss/night sweats) argues against acute conditions. Use age/sex as a prior. Apply India-endemic context.
+- confidence_score 0-1. Rank EXACTLY 3 differentials (name, confidence High>=70%/Moderate 50-70%/Low<50%, 1-line reasoning tied to findings+negatives). Weigh acuity: chronic course (weeks + weight loss/night sweats) argues against acute conditions. Use age/sex as a prior. Apply India-endemic context ONLY when the reported findings support it — never list an endemic disease (TB, dengue, typhoid, pertussis) unless the patient's positives clearly point to it.
+- STAY CONSISTENT with the computed posterior above: re-rank only when the latest answer clearly changes the evidence. A disease whose key symptoms the patient DENIED must never rank in the top 2.
 - differentiator_symptom = the feature best separating #1 vs #2. running_summary = 2 short clinical sentences.
 
 PART 2 — next question (skip if stopping):
@@ -723,8 +767,9 @@ PART 2 — next question (skip if stopping):
 - Already covered, never re-ask: {covered_text}
 - Probe EXACTLY ONE dimension. A-D are mutually-exclusive ANSWERS to that single question (levels/variants of it), NOT a list of different symptoms — never bundle multiple screening topics into one question. E = "Not sure / None of these".
 - Split the top 2 differentials. Cover still-missing high-yield axes first (duration/onset, then red-flag, severity, quality/location). Use age/sex to pick demographic-specific dimensions (e.g. menstrual_pregnancy for a reproductive-age female with lower-abdominal pain). 5-10 words.
+- Plain language for a patient with no medical background: everyday words only, never clinical/technical terms (say "trouble breathing" not "dyspnea", "throwing up" not "emesis", "coughing up blood" not "hemoptysis"). Question: 5-10 words. Each option A-D: a short, concrete phrase, 2-6 words.
 
-EARLY STOP: if turn >= 12, OR the top suspect is High-confidence with its key differentiators already answered → return exactly {{"ready_for_diagnosis": true}} and omit next_question.
+EARLY STOP: only if turn >= {MAX_FOLLOWUP_QUESTIONS}, OR (turn >= {MIN_FOLLOWUP_QUESTIONS} AND the top suspect is High-confidence with its key differentiators already answered) → return exactly {{"ready_for_diagnosis": true}} and omit next_question. NEVER stop before turn {MIN_FOLLOWUP_QUESTIONS}.
 
 Return JSON in ONE format.
 Continue:

@@ -267,26 +267,26 @@ async def send_admin_new_user(name: str, email: str) -> bool:
 
 async def send_admin_purchase_request(
     user_name: str, user_email: str, plan_name: str, amount_inr: int,
-    credits: int, order_id: str, payment_reference: str = "", note: str = "",
+    credits: int, order_id: str, phone: str = "", note: str = "",
 ) -> bool:
     """Notify admin that a user has requested a plan and (claims to have) paid."""
     body = (
         f"A user has requested a plan and is awaiting approval.<br><br>"
         f"<strong>User:</strong> {user_name} ({user_email})<br>"
+        f"<strong>Phone:</strong> {phone or '—'}<br>"
         f"<strong>Plan:</strong> {plan_name}<br>"
         f"<strong>Amount:</strong> ₹{amount_inr}<br>"
         f"<strong>Credits:</strong> {credits}<br>"
         f"<strong>Order ID:</strong> {order_id}<br>"
-        f"<strong>Payment reference:</strong> {payment_reference or '—'}<br>"
         f"<strong>Note:</strong> {note or '—'}<br><br>"
         f"Verify the payment, then approve or reject the request from the admin "
         f"dashboard → Payments."
     )
     text = (
         f"VADG plan request awaiting approval.\n"
-        f"User: {user_name} ({user_email})\nPlan: {plan_name}\n"
+        f"User: {user_name} ({user_email})\nPhone: {phone or '-'}\nPlan: {plan_name}\n"
         f"Amount: Rs.{amount_inr}\nCredits: {credits}\nOrder: {order_id}\n"
-        f"Payment ref: {payment_reference or '-'}\nNote: {note or '-'}\n"
+        f"Note: {note or '-'}\n"
         f"Approve/reject from the admin dashboard."
     )
     return await _notify_admin("New plan purchase request", body, text)
@@ -294,21 +294,22 @@ async def send_admin_purchase_request(
 
 async def send_purchase_request_ack(to_email: str, name: str, plan_name: str, amount_inr: int, order_id: str) -> bool:
     """Acknowledge to the user that their request was received (pending verification)."""
-    subject = "We received your plan request"
+    subject = "We got your purchase request"
     html = _wrap(
         "Request received",
-        f"Hi {name or 'there'},<br><br>Thanks — we've received your request for the "
-        f"<strong>{plan_name}</strong> plan (₹{amount_inr}).<br><br>"
-        f"Your reference is <strong>{order_id}</strong>. Our team will verify your "
-        f"payment and activate your report credits, usually within a few hours. "
-        f"You'll get an email as soon as it's approved.<br><br>"
-        f"If you haven't completed the payment yet, please follow the payment "
-        f"instructions shown on the pricing page.",
+        f"Hi {name or 'there'},<br><br>We got your purchase request for the "
+        f"<strong>{plan_name}</strong> plan (₹{amount_inr}). Our team will connect "
+        f"with you shortly to verify your payment and activate your report "
+        f"credits.<br><br>"
+        f"Your reference is <strong>{order_id}</strong>. You'll also get an email "
+        f"as soon as it's approved.<br><br>"
+        f"Thank you!",
     )
     text = (
-        f"Hi {name or 'there'},\n\nWe received your request for the {plan_name} plan "
-        f"(Rs.{amount_inr}). Reference: {order_id}. We'll verify your payment and "
-        f"activate your credits shortly.\n\n- VADG"
+        f"Hi {name or 'there'},\n\nWe got your purchase request for the {plan_name} "
+        f"plan (Rs.{amount_inr}). Our team will connect with you shortly to verify "
+        f"your payment and activate your report credits. Reference: {order_id}.\n\n"
+        f"Thank you!\n\n- VADG"
     )
     return await _send(to_email, subject, html, text)
 

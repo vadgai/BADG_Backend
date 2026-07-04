@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 
 # --- Tunable constants (validate/adjust via tests/eval_information_gain.py) -----
 TOP_K = 6                     # candidate diagnoses the belief state ranges over
-CONFIDENCE_STOP = 0.80        # stop if the top posterior exceeds this
-ENTROPY_STOP = 0.55           # ...or if entropy (nats) drops below this
+CONFIDENCE_STOP = 0.85        # stop if the top posterior exceeds this
+ENTROPY_STOP = 0.45           # ...or if entropy (nats) drops below this
 
 # P(finding present | disease) by which bucket the disease lists the finding in.
 _BUCKET_PROB = {"key": 0.85, "supportive": 0.50, "rare": 0.20}
@@ -294,6 +294,63 @@ def _ensure_profiles():
     return loaded
 
 
+# Acuity / severity / catch-all qualifiers that distinguish DB entries for the
+# same underlying condition (e.g. "Bronchitis" / "Acute Bronchitis" / "COPD
+# Exacerbation"). Stripping them exposes the core so near-duplicates collapse.
+_NAME_QUALIFIERS = {
+    "acute", "chronic", "subacute", "exacerbation", "flare", "disease", "syndrome",
+    "disorder", "infection", "condition", "primary", "secondary", "mild", "moderate",
+    "severe", "early", "late", "stage", "of", "the", "a", "an", "and", "with", "type",
+}
+
+
+def _core_name_tokens(name: str) -> frozenset:
+    """Core disease tokens with acuity/severity qualifiers stripped."""
+    toks = [t for t in re.findall(r"[a-z0-9]+", str(name or "").lower())
+            if t not in _NAME_QUALIFIERS]
+    return frozenset(toks)
+
+
+def _core_names_equivalent(a: str, b: str) -> bool:
+    """Strict: same core token set. Used for DEDUP (must not merge AKI vs CKD)."""
+    ca, cb = _core_name_tokens(a), _core_name_tokens(b)
+    if not ca or not cb:
+        return False
+    # Equal cores, or one core is the whole of the other (e.g. {copd} vs {copd}).
+    return ca == cb
+
+
+def _core_names_related(a: str, b: str) -> bool:
+    """Lenient: cores equal OR one is a subset of the other. Used for matching a
+    paraphrased LLM diagnosis name back to a posterior key ("Adult-onset asthma"
+    → "Asthma", "Community-acquired pneumonia" → "Pneumonia"). Safe here because
+    the posterior key set is small and already deduped into distinct diseases."""
+    ca, cb = _core_name_tokens(a), _core_name_tokens(b)
+    if not ca or not cb:
+        return False
+    return ca == cb or ca <= cb or cb <= ca
+
+
+def _dedupe_near_duplicate_conditions(conditions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collapse same-core disease variants, keeping the highest-ranked (first) one.
+
+    analyze_case returns score-sorted conditions, so the first occurrence of a
+    core is the best-scoring variant. Prevents the posterior mass for one
+    condition being split across "X" / "Acute X" / "Chronic X" and stops the
+    report showing a redundant variant of #1 as #2.
+    """
+    kept: List[Dict[str, Any]] = []
+    kept_cores: List[frozenset] = []
+    for cond in conditions:
+        name = str(cond.get("name", ""))
+        core = _core_name_tokens(name)
+        if core and any(core == kc for kc in kept_cores):
+            continue
+        kept.append(cond)
+        kept_cores.append(core)
+    return kept
+
+
 def _belief_state(patient_state: Dict[str, Any], top_k: int = TOP_K) -> Optional[Dict[str, Any]]:
     """Build the posterior belief state over the rule engine's top candidates."""
     from diagnosis_rule_engine import analyze_case
@@ -314,6 +371,9 @@ def _belief_state(patient_state: Dict[str, Any], top_k: int = TOP_K) -> Optional
 
     ranking = analyze_case(age=age, gender=gender, symptoms=positives, negatives=negatives)
     conditions = (ranking or {}).get("conditions") or []
+    # Collapse same-core variants (Bronchitis / Acute Bronchitis) BEFORE slicing
+    # so top_k isn't spent on duplicates and the posterior isn't mass-split.
+    conditions = _dedupe_near_duplicate_conditions(conditions)
     by_name = {_norm(p.get("name")): p for p in profiles}
     candidates: List[Dict[str, Any]] = []
     names: List[str] = []
@@ -422,12 +482,21 @@ def rank_candidate_findings(patient_state: Dict[str, Any], top_k: int = TOP_K, l
         candidates, posterior = bs["candidates"], bs["posterior"]
         known, asked_dims = bs["known"], bs["asked_dims"]
 
+        # Only source candidate findings from diseases carrying real posterior
+        # mass (top-3 plus anything >= 15%), and only from key/supportive
+        # buckets. Rare features of long-shot candidates are exactly the
+        # "glossitis for a cough case" generic screens we must never surface.
+        allowed = set(bs["order"][:3]) | {i for i, p in enumerate(posterior) if p >= 0.15}
+
         scored: List[Dict[str, Any]] = []
         seen_terms: set = set()
         seen_dims: set = set()
-        for prof in candidates:
+        for idx in bs["order"]:
+            if idx not in allowed:
+                continue
+            prof = candidates[idx]
             feats = prof.get("features", {}) if isinstance(prof.get("features"), dict) else {}
-            for bucket in ("key", "supportive", "rare"):
+            for bucket in ("key", "supportive"):
                 for f in feats.get(bucket, []) or []:
                     term = _norm(f.get("term"))
                     if not term or term in seen_terms or term in known:

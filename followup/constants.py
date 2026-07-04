@@ -3,7 +3,11 @@
 JACCARD_REPEAT_THRESHOLD = 0.72
 OPTION_OVERLAP_THRESHOLD = 0.75
 
-MIN_FOLLOWUP_QUESTIONS = 4
+# The flow is 8-12 diagnostic "questions": MCQs 1-6, the midpoint symptom card
+# as #7, then MCQs 8-12. Early stop is allowed only from question MIN onward,
+# and only when the diagnosis is high-confidence — so every session asks at
+# least 8 questions and never more than 12.
+MIN_FOLLOWUP_QUESTIONS = 8
 MAX_FOLLOWUP_QUESTIONS = 12
 
 # Canonical clinical dimensions a follow-up question can probe. The LLM must tag

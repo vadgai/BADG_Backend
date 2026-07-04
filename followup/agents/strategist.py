@@ -8,6 +8,7 @@ before falling back to open-ended LLM question generation.
 import logging
 from typing import Any, Dict, Optional, Union
 
+from followup.constants import MAX_FOLLOWUP_QUESTIONS, MIN_FOLLOWUP_QUESTIONS
 from followup.feature_tracking import is_feature_already_asked
 from followup.validators.mcq_quality import validate_mcq_quality
 
@@ -31,7 +32,7 @@ def plan_next_question(patient_state: Dict[str, Any]) -> Optional[Dict[str, Any]
         return None
 
     turn_count = int(patient_state.get("turn_count", 0) or 0)
-    if turn_count >= 12:
+    if turn_count >= MAX_FOLLOWUP_QUESTIONS:
         return "Ready for diagnosis"
 
     symptom_state = (
@@ -92,9 +93,10 @@ def build_strategy_context(patient_state: Dict[str, Any]) -> str:
     if isinstance(ig, dict) and ig.get("feature_term") and ig.get("top_two"):
         top_two = ig["top_two"]
         competitor = top_two[1] if len(top_two) > 1 else "alternate diagnosis"
+        turn_count = int(patient_state.get("turn_count", 0) or 0)
         stop_hint = (
             " The differential is already concentrated — conclude if its key differentiators are answered."
-            if ig.get("ready")
+            if ig.get("ready") and turn_count >= MIN_FOLLOWUP_QUESTIONS
             else ""
         )
         return (

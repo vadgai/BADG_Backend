@@ -165,6 +165,9 @@ async def create_indexes():
         # TTL index: auto-delete reports older than 30 days
         await _database.reports.create_index("timestamp", expireAfterSeconds=2592000)
 
+        # anon_report_usage: one free-report entitlement per anonymous device id
+        await _database.anon_report_usage.create_index("anon_id", unique=True)
+
         # Partial reports collection for last-stage drop-offs
         await _database.partial_reports.create_index("createdAt")
         await _database.partial_reports.create_index("sessionId")
