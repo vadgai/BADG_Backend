@@ -39,18 +39,28 @@ def _collection():
     return db[COLLECTION] if db is not None else None
 
 
-async def has_used_free_report(anon_id: Optional[str]) -> bool:
-    """True if this device has already consumed its free report (or has no id
-    at all — a missing id is treated as ineligible, so the frontend forgetting
-    to send it fails closed rather than granting unlimited free reports)."""
+async def has_used_free_report(anon_id: Optional[str], session_id: Optional[str] = None) -> bool:
+    """
+    True if this device must be blocked from generating another free report
+    (or has no id at all — a missing id is treated as ineligible, so the
+    frontend forgetting to send it fails closed rather than granting
+    unlimited free reports).
+
+    When `session_id` is given and matches the session this device already
+    unlocked, this returns False (not blocked) even though the device's
+    one-time allowance is "used" — re-fetching, exporting, switching
+    language, or a page refresh/duplicate request for that SAME report must
+    keep working. Only a request for a DIFFERENT session is blocked.
+    """
     if not anon_id:
         return True
     col = _collection()
-    if col is not None:
-        doc = await col.find_one({"anon_id": anon_id})
-        return bool(doc and doc.get("used"))
-    doc = _mem_usage.get(anon_id)
-    return bool(doc and doc.get("used"))
+    doc = await col.find_one({"anon_id": anon_id}) if col is not None else _mem_usage.get(anon_id)
+    if not doc or not doc.get("used"):
+        return False
+    if session_id and doc.get("session_id") == session_id:
+        return False
+    return True
 
 
 async def try_consume(anon_id: Optional[str], session_id: str) -> bool:

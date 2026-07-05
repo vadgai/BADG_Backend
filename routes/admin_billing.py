@@ -147,13 +147,12 @@ async def adjust_credits(user_id: str, payload: AdjustCreditsRequest, _admin=Dep
     user = await user_service.get_user_by_id(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    current = int(user.get("report_credits", 0) or 0)
-    new_balance = max(0, current + int(payload.delta))
-    await user_service.update_user(user_id, {"report_credits": new_balance})
+    updated = await user_service.adjust_credits_atomic(user_id, int(payload.delta))
+    if updated is None:
+        raise HTTPException(status_code=404, detail="User not found")
     logger.info("Admin adjusted credits for %s: %+d -> %d (%s)",
-                user.get("email"), payload.delta, new_balance, payload.reason or "")
-    fresh = await user_service.get_user_by_id(user_id)
-    return {"success": True, "user": _user_with_billing(fresh)}
+                user.get("email"), payload.delta, int(updated.get("report_credits", 0) or 0), payload.reason or "")
+    return {"success": True, "user": _user_with_billing(updated)}
 
 
 # ---------------------------------------------------------------------------

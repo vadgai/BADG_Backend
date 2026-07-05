@@ -73,6 +73,21 @@ async def _usage_by_session(session_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+async def session_already_unlocked(session_id: str) -> bool:
+    """
+    Whether this session's report was already generated and charged (for free
+    or via credit) at some point in the past — safe to re-fetch, export, or
+    switch language for, regardless of the user's CURRENT balance.
+
+    Callers must check this BEFORE gating on the user's live balance: a user
+    who had 1 free report today, used it on this exact session, and is simply
+    reloading the report page (or the frontend re-fires the request) would
+    otherwise be incorrectly told "no reports remaining" even though this
+    specific report was already paid for and is just being re-displayed.
+    """
+    return await _usage_by_session(session_id) is not None
+
+
 async def _record_usage(user: Dict[str, Any], session_id: str, source: str, disease: Optional[str]) -> bool:
     """
     Atomically claim `session_id` for a usage record.
@@ -224,6 +239,22 @@ def get_balance(user: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Consume (enforcement)
 # ---------------------------------------------------------------------------
+async def _set_usage_source(session_id: str, source: str) -> None:
+    """Fix up the source label on a usage record claimed as a placeholder
+    before the actual free/credit branch was decided (see check_and_consume)."""
+    col = _usage_collection()
+    if col is not None:
+        try:
+            await col.update_one({"session_id": session_id}, {"$set": {"source": source}})
+        except Exception as e:
+            logger.error("Failed to set usage source for %s: %s", session_id, e)
+        return
+    for r in _mem_usage:
+        if r.get("session_id") == session_id:
+            r["source"] = source
+            break
+
+
 async def check_and_consume(
     user: Dict[str, Any], session_id: str, disease: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -233,11 +264,24 @@ async def check_and_consume(
     generation never costs a credit.
 
     Returns {"allowed": bool, "source": str, "reason": str, "balance": {...}}.
-    Idempotent and race-safe: an already-unlocked session is always allowed
-    without charge, and concurrent calls for the same session_id (double
-    submit, retry, two tabs) can only ever decrement the balance once — the
-    balance is only touched after this session_id is atomically claimed via
-    _record_usage, which is backed by a unique index.
+
+    Idempotent and race-safe against BOTH races this system is exposed to:
+      - Same session_id claimed twice (double submit / retry / two tabs on the
+        same report): `_record_usage` is backed by a unique index on
+        session_id, so only the first caller wins the claim; every other
+        caller is told the session is already unlocked and never touches the
+        balance.
+      - Two DIFFERENT session_ids racing for the same shared per-user balance
+        (e.g. two tabs each finishing a different diagnosis at once, with only
+        one free report or one credit left): the balance debit below uses
+        `user_service.try_consume_free_report` / `try_consume_credit`, each a
+        single DB-conditional write that re-checks the balance at commit time
+        rather than against the possibly-stale `user` snapshot passed in — so
+        only one of the two concurrent sessions can actually claim the last
+        slot; the other falls through to "no_reports_remaining" (delivered
+        uncharged rather than double-spent — see the caller in app.py, which
+        already tolerates an uncharged delivery for a report that was
+        generated before the balance was found to be exhausted).
     """
     uid = str(user["_id"])
 
@@ -252,40 +296,37 @@ async def check_and_consume(
         await _record_usage(user, session_id, "admin", disease)
         return {"allowed": True, "source": "admin", "balance": get_balance(user)}
 
+    # Claim this session_id first (source is a placeholder, corrected below
+    # once we know which branch actually paid for it). Losing this race means
+    # another concurrent call for the SAME session already claimed/is
+    # claiming it — never touch the balance in that case.
+    if not await _record_usage(user, session_id, "credit", disease):
+        existing = await _usage_by_session(session_id)
+        return {"allowed": True, "source": (existing or {}).get("source", "credit"),
+                "already_unlocked": True, "balance": get_balance(user)}
+
     today = _today()
-    free_used = user.get("free_report_count", 0) if user.get("free_report_date") == today else 0
-    total = int(user.get("total_reports", 0) or 0)
+    updated = await user_service.try_consume_free_report(uid, today, FREE_REPORTS_PER_DAY)
+    source = "free"
+    if updated is None:
+        updated = await user_service.try_consume_credit(uid)
+        source = "credit"
 
-    # 1) Daily free allowance
-    if free_used < FREE_REPORTS_PER_DAY:
-        # Claim the session BEFORE touching the balance — only the winner of
-        # this atomic insert may decrement it.
-        if not await _record_usage(user, session_id, "free", disease):
-            return {"allowed": True, "already_unlocked": True, "balance": get_balance(user)}
-        await user_service.update_user(uid, {
-            "free_report_date": today,
-            "free_report_count": free_used + 1,
-            "total_reports": total + 1,
-        })
-        user["free_report_date"] = today
-        user["free_report_count"] = free_used + 1
-        user["total_reports"] = total + 1
-        return {"allowed": True, "source": "free", "balance": get_balance(user)}
+    if updated is not None:
+        await _set_usage_source(session_id, source)
+        user.update(updated)
+        return {"allowed": True, "source": source, "balance": get_balance(user)}
 
-    # 2) Paid credits
-    credits = int(user.get("report_credits", 0) or 0)
-    if credits > 0:
-        if not await _record_usage(user, session_id, "credit", disease):
-            return {"allowed": True, "already_unlocked": True, "balance": get_balance(user)}
-        await user_service.update_user(uid, {
-            "report_credits": credits - 1,
-            "total_reports": total + 1,
-        })
-        user["report_credits"] = credits - 1
-        user["total_reports"] = total + 1
-        return {"allowed": True, "source": "credit", "balance": get_balance(user)}
-
-    # 3) Out of entitlements
+    # Balance was already exhausted, or drained by a concurrent session,
+    # by the time we tried to charge it. The report is already generated at
+    # this point (see the caller) — this can only under-charge, never
+    # double-charge. Label the usage record accurately for admin analytics;
+    # a future re-fetch of this same session_id remains free either way.
+    await _set_usage_source(session_id, "uncharged")
+    logger.warning(
+        "check_and_consume: session %s claimed but no balance left to charge (user=%s)",
+        session_id, uid,
+    )
     return {
         "allowed": False,
         "reason": "no_reports_remaining",
@@ -300,22 +341,26 @@ async def grant_credits(
     user_id: str, credits: int, *, plan_code: Optional[str] = None,
     plan_name: Optional[str] = None, set_subscription: bool = True,
 ) -> Optional[int]:
-    """Add credits to a user; optionally record the plan as their current pack."""
-    user = await user_service.get_user_by_id(user_id)
-    if not user:
+    """Add credits to a user; optionally record the plan as their current pack.
+
+    The increment itself is atomic ($inc), so two concurrent grants for the
+    same user (e.g. an admin double-clicking "approve") each add their own
+    credits correctly rather than one clobbering the other's read-then-write.
+    """
+    updated = await user_service.add_credits_atomic(user_id, int(credits))
+    if updated is None:
         return None
-    new_balance = int(user.get("report_credits", 0) or 0) + int(credits)
-    updates: Dict[str, Any] = {"report_credits": new_balance}
     if set_subscription and plan_name:
-        updates["subscription"] = {
-            "plan_code": plan_code,
-            "plan_name": plan_name,
-            "credits": credits,
-            "purchased_at": datetime.utcnow(),
-        }
-        updates["credits_purchased_total"] = int(user.get("credits_purchased_total", 0) or 0) + int(max(0, credits))
-    await user_service.update_user(user_id, updates)
-    return new_balance
+        await user_service.update_user(user_id, {
+            "subscription": {
+                "plan_code": plan_code,
+                "plan_name": plan_name,
+                "credits": credits,
+                "purchased_at": datetime.utcnow(),
+            },
+            "credits_purchased_total": int(updated.get("credits_purchased_total", 0) or 0) + int(max(0, credits)),
+        })
+    return int(updated.get("report_credits", 0) or 0)
 
 
 # ---------------------------------------------------------------------------

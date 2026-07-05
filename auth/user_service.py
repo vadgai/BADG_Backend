@@ -34,6 +34,11 @@ except Exception:  # bson ships with pymongo; guard just in case
         pass
 
 try:
+    from pymongo import ReturnDocument
+except Exception:  # pragma: no cover - pymongo always ships with motor
+    ReturnDocument = None
+
+try:
     from database.connection import get_database, is_database_available
 except Exception:  # pragma: no cover - fallback for unusual import paths
     def get_database():
@@ -161,6 +166,134 @@ async def update_user(user_id: str, fields: Dict[str, Any]) -> bool:
         return False
     u.update(fields)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Atomic balance mutations
+#
+# These exist because `update_user` is a blind `$set` of a caller-computed
+# value. Callers that read a balance, compute `balance - 1`, then `$set` it
+# race: two concurrent requests for the same user (e.g. two browser tabs each
+# generating a different report) can both read the same starting balance and
+# both write the same decremented result, letting a single credit / daily free
+# report be spent twice. Each function below is a single conditional DB write
+# for the MongoDB backend (the filter re-checks the balance against the
+# document's CURRENT state, not a stale snapshot — MongoDB serializes writes
+# to one document, so a second concurrent caller's filter is evaluated after
+# the first caller's write lands and correctly fails to match). The in-memory
+# fallback performs the check-and-mutate synchronously with no `await` between
+# the read and the write, so no other asyncio task can interleave.
+# ---------------------------------------------------------------------------
+async def try_consume_free_report(user_id: str, today: str, limit: int) -> Optional[Dict[str, Any]]:
+    """Atomically claim one daily free-report slot. Returns the updated user
+    document on success, or None if today's allowance is already exhausted."""
+    col = _collection()
+    if col is not None:
+        oid = _to_object_id(user_id)
+        if oid is None:
+            return None
+        now = datetime.utcnow()
+        doc = await col.find_one_and_update(
+            {"_id": oid, "free_report_date": today, "free_report_count": {"$lt": limit}},
+            {"$inc": {"free_report_count": 1, "total_reports": 1}, "$set": {"updated_at": now}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if doc is not None:
+            return doc
+        # Not yet rolled over to today (or never used) — only matches if no
+        # other concurrent caller has already rolled it over for today.
+        return await col.find_one_and_update(
+            {"_id": oid, "free_report_date": {"$ne": today}},
+            {"$set": {"free_report_date": today, "free_report_count": 1, "updated_at": now},
+             "$inc": {"total_reports": 1}},
+            return_document=ReturnDocument.AFTER,
+        )
+
+    u = _mem_users.get(str(user_id))
+    if not u:
+        return None
+    free_used = u.get("free_report_count", 0) if u.get("free_report_date") == today else 0
+    if free_used >= limit:
+        return None
+    u["free_report_date"] = today
+    u["free_report_count"] = free_used + 1
+    u["total_reports"] = int(u.get("total_reports", 0) or 0) + 1
+    u["updated_at"] = datetime.utcnow()
+    return u
+
+
+async def try_consume_credit(user_id: str) -> Optional[Dict[str, Any]]:
+    """Atomically deduct one report credit. Returns the updated user document
+    on success, or None if the balance is already zero."""
+    col = _collection()
+    if col is not None:
+        oid = _to_object_id(user_id)
+        if oid is None:
+            return None
+        return await col.find_one_and_update(
+            {"_id": oid, "report_credits": {"$gte": 1}},
+            {"$inc": {"report_credits": -1, "total_reports": 1}, "$set": {"updated_at": datetime.utcnow()}},
+            return_document=ReturnDocument.AFTER,
+        )
+
+    u = _mem_users.get(str(user_id))
+    if not u:
+        return None
+    credits = int(u.get("report_credits", 0) or 0)
+    if credits < 1:
+        return None
+    u["report_credits"] = credits - 1
+    u["total_reports"] = int(u.get("total_reports", 0) or 0) + 1
+    u["updated_at"] = datetime.utcnow()
+    return u
+
+
+async def add_credits_atomic(user_id: str, credits: int) -> Optional[Dict[str, Any]]:
+    """Atomically add (non-negative) credits, e.g. after a purchase. Returns
+    the updated user document, or None if the user doesn't exist."""
+    col = _collection()
+    if col is not None:
+        oid = _to_object_id(user_id)
+        if oid is None:
+            return None
+        return await col.find_one_and_update(
+            {"_id": oid},
+            {"$inc": {"report_credits": int(credits)}, "$set": {"updated_at": datetime.utcnow()}},
+            return_document=ReturnDocument.AFTER,
+        )
+
+    u = _mem_users.get(str(user_id))
+    if not u:
+        return None
+    u["report_credits"] = int(u.get("report_credits", 0) or 0) + int(credits)
+    u["updated_at"] = datetime.utcnow()
+    return u
+
+
+async def adjust_credits_atomic(user_id: str, delta: int) -> Optional[Dict[str, Any]]:
+    """Atomically add/subtract credits (admin adjustment), floored at 0.
+    Uses an aggregation-pipeline update so the floor is applied in the same
+    atomic write as the increment (no separate read-then-clamp race)."""
+    col = _collection()
+    if col is not None:
+        oid = _to_object_id(user_id)
+        if oid is None:
+            return None
+        return await col.find_one_and_update(
+            {"_id": oid},
+            [{"$set": {
+                "report_credits": {"$max": [0, {"$add": [{"$ifNull": ["$report_credits", 0]}, int(delta)]}]},
+                "updated_at": datetime.utcnow(),
+            }}],
+            return_document=ReturnDocument.AFTER,
+        )
+
+    u = _mem_users.get(str(user_id))
+    if not u:
+        return None
+    u["report_credits"] = max(0, int(u.get("report_credits", 0) or 0) + int(delta))
+    u["updated_at"] = datetime.utcnow()
+    return u
 
 
 async def set_last_login(user_id: str) -> None:

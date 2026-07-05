@@ -787,21 +787,29 @@ async def generate_report(
         if await get_or_restore_session(session_id, session_store) is None:
             raise HTTPException(status_code=404, detail="Session not found")
 
+        # A session whose report was already generated (for free or via
+        # credit) at some point is ALWAYS safe to re-fetch — reloading the
+        # report page, exporting to PDF, switching language, or a duplicate
+        # in-flight request must never be blocked by a balance/allowance that
+        # has since been spent elsewhere. Skip the gates entirely in that case.
+        already_unlocked = await billing_entitlements.session_already_unlocked(session_id)
+
         if current_user:
             # --- Peek only: fail fast if nothing is left, don't consume yet ---
-            balance_peek = billing_entitlements.get_balance(current_user)
-            if not balance_peek.get("reports_available"):
-                raise HTTPException(
-                    status_code=402,
-                    detail={
-                        "code": "no_reports_remaining",
-                        "message": "No credits left. Please purchase more credits to generate another diagnosis report.",
-                        "balance": balance_peek,
-                    },
-                )
+            if not already_unlocked:
+                balance_peek = billing_entitlements.get_balance(current_user)
+                if not balance_peek.get("reports_available"):
+                    raise HTTPException(
+                        status_code=402,
+                        detail={
+                            "code": "no_reports_remaining",
+                            "message": "No credits left. Please purchase more credits to generate another diagnosis report.",
+                            "balance": balance_peek,
+                        },
+                    )
         else:
             # --- Anonymous: peek at the one free report per device -----------
-            if await anon_entitlements.has_used_free_report(x_anon_id):
+            if not already_unlocked and await anon_entitlements.has_used_free_report(x_anon_id, session_id):
                 raise HTTPException(
                     status_code=401,
                     detail={

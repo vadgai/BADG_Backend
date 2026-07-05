@@ -32,6 +32,11 @@ except Exception:
     def get_database():
         return None
 
+try:
+    from pymongo import ReturnDocument
+except Exception:  # pragma: no cover - pymongo always ships with motor
+    ReturnDocument = None
+
 from billing import entitlements
 
 PAYMENTS_COLLECTION = "payments"
@@ -121,6 +126,31 @@ async def get_payment_by_order(order_id: str) -> Optional[Dict[str, Any]]:
     return _mem_payments.get(order_id)
 
 
+async def _try_mark_paid(order_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Atomically transition an order from `pending` to `paid`.
+
+    Returns the updated payment doc if this call won the transition, or None
+    if the order was not in `pending` state (e.g. a concurrent approve/confirm
+    call already won). Callers must only grant credits when this returns
+    non-None — otherwise two near-simultaneous approvals of the same order
+    (double-click, retry, or admin + auto-confirm racing) would both pass a
+    stale `status == "pending"` read and both grant credits.
+    """
+    col = _collection()
+    if col is not None:
+        return await col.find_one_and_update(
+            {"order_id": order_id, "status": "pending"},
+            {"$set": updates},
+            return_document=ReturnDocument.AFTER,
+        )
+    payment = _mem_payments.get(order_id)
+    if not payment or payment.get("status") != "pending":
+        return None
+    payment.update(updates)
+    return payment
+
+
 # ---------------------------------------------------------------------------
 # Confirm order
 # ---------------------------------------------------------------------------
@@ -156,8 +186,13 @@ async def confirm_order(
         "paid_at": now,
         "provider_payment_id": provider_payment_id or ("manual_" + uuid.uuid4().hex[:16]),
     }
-    await _apply_updates(order_id, updates)
-    payment.update(updates)
+    won = await _try_mark_paid(order_id, updates)
+    if won is None:
+        # Lost the race to a concurrent confirm/approve of the SAME order —
+        # whoever won already granted credits; never grant twice.
+        payment = await get_payment_by_order(order_id) or payment
+        return True, "Order already confirmed", payment
+    payment = won
 
     # Grant credits for the purchased plan.
     await entitlements.grant_credits(
@@ -168,14 +203,6 @@ async def confirm_order(
     )
 
     return True, "Payment successful", payment
-
-
-async def _apply_updates(order_id: str, updates: Dict[str, Any]) -> None:
-    col = _collection()
-    if col is not None:
-        await col.update_one({"order_id": order_id}, {"$set": updates})
-    elif order_id in _mem_payments:
-        _mem_payments[order_id].update(updates)
 
 
 # ---------------------------------------------------------------------------
@@ -202,8 +229,14 @@ async def approve_order(order_id: str, admin_email: Optional[str] = None) -> Tup
         "reviewed_by": admin_email,
         "provider_payment_id": payment.get("provider_payment_id") or ("manual_" + uuid.uuid4().hex[:16]),
     }
-    await _apply_updates(order_id, updates)
-    payment.update(updates)
+    won = await _try_mark_paid(order_id, updates)
+    if won is None:
+        # Lost the race to a concurrent approve/confirm of the SAME order
+        # (e.g. a double-clicked "Approve" button) — credits were already
+        # granted by whoever won; never grant twice.
+        payment = await get_payment_by_order(order_id) or payment
+        return True, "Order already approved", payment
+    payment = won
 
     await entitlements.grant_credits(
         str(payment.get("user_id")),
@@ -226,9 +259,25 @@ async def reject_order(order_id: str, reason: Optional[str] = None, admin_email:
     if reason:
         note = (note + " | " if note else "") + f"Rejected: {reason}"
     updates = {"status": "cancelled", "reviewed_by": admin_email, "note": note}
-    await _apply_updates(order_id, updates)
-    payment.update(updates)
-    return True, "Payment rejected", payment
+    # Conditioned on still-pending so a reject racing a concurrent approve of
+    # the SAME order can never overwrite an already-paid (credits granted)
+    # order's status back to "cancelled".
+    col = _collection()
+    if col is not None:
+        won = await col.find_one_and_update(
+            {"order_id": order_id, "status": "pending"},
+            {"$set": updates},
+            return_document=ReturnDocument.AFTER,
+        )
+    else:
+        won = None
+        if _mem_payments.get(order_id, {}).get("status") == "pending":
+            _mem_payments[order_id].update(updates)
+            won = _mem_payments[order_id]
+    if won is None:
+        payment = await get_payment_by_order(order_id) or payment
+        return False, f"Order cannot be rejected (status: {payment.get('status')})", payment
+    return True, "Payment rejected", won
 
 
 # ---------------------------------------------------------------------------
