@@ -165,7 +165,12 @@ def map_client_answer(client_msg_raw: str, last_response: Dict) -> str:
         mapped = last_response.get(client_msg_clean)
         if mapped:
             return mapped
-    for _key, value in last_response.items():
+    # Only match against the actual option display text (A-E) here — never
+    # against metadata fields like feature_id/priority/question_source, which
+    # are raw internal identifiers (e.g. "pain_location") and would otherwise
+    # leak into the patient's answer instead of a real option's label.
+    for key in ("A", "B", "C", "D", "E"):
+        value = last_response.get(key)
         if isinstance(value, str) and client_msg_clean in value.upper():
             return value
     return client_msg_raw.strip()

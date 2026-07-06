@@ -21,6 +21,7 @@ htmlcov/
 
 # Virtual Environment
 venv/
+.venv/
 env/
 ENV/
 
@@ -70,4 +71,10 @@ en_core_sci_sm-0.5.4.tar.gz
 *.json
 !package.json
 !positive-shell-475102-t5-3635a8666240.json
+# Disease definitions are runtime data read by diagnosis_rule_engine.py at
+# startup (Path.glob("D*.json")) — the blanket *.json rule above was silently
+# excluding all 303 of them from every deployment, degrading diagnosis and
+# symptom-card generation to an empty/fallback state in production while dev
+# (which doesn't go through gcloudignore) worked fine. Keep them included.
+!diseases/*.json
 

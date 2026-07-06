@@ -1,13 +1,12 @@
 """
-Follow-up orchestrator — coordinates Analyzer, Strategist, Writer, and Critic agents.
+Follow-up orchestrator — coordinates Analyzer, Writer, and Critic agents.
 """
 
 import logging
 from datetime import datetime
 from typing import Any, Dict, Tuple, Union
 
-from followup.constants import MAX_FOLLOWUP_QUESTIONS, MIN_FOLLOWUP_QUESTIONS
-from followup.agents.strategist import build_strategy_context, plan_next_question
+from followup.constants import MAX_FOLLOWUP_QUESTIONS
 from followup.agents.writer import build_followup_writer_prompt
 from followup.agents.critic import QuestionCritic
 from followup.validators.mcq_quality import validate_mcq_quality
@@ -43,10 +42,7 @@ def update_state_with_answer(
 
     from diagnosis_methods.state_followup import analyze_answer_for_state
 
-    # Build strategy hint (rule-based, zero tokens cost)
-    strategy_hint = build_strategy_context(patient_state)
-
-    analysis = analyze_answer_for_state(question, answer, patient_state, strategy_hint=strategy_hint)
+    analysis = analyze_answer_for_state(question, answer, patient_state)
     if analysis:
         # ── Stash the pre-generated next question before updating state ──
         # Pop it so it is never written to persistent storage fields.
@@ -57,6 +53,13 @@ def update_state_with_answer(
                 "orchestrator: stashed _pending_next_question q=%r",
                 str(pending_q.get("Question", ""))[:80],
             )
+        # Preserve the combined call's ready signal — previously this was
+        # silently dropped (only next_question was stashed), so the writer
+        # would generate another question even after the analyzer concluded
+        # the diagnosis was ready. get_next_followup_question gates it
+        # through can_stop_early() before honoring it.
+        if bool(analysis.get("ready_for_diagnosis")):
+            patient_state["_llm_ready_for_diagnosis"] = True
 
         patient_state = update_patient_state(patient_state, question, answer, analysis)
     else:
@@ -91,9 +94,8 @@ def get_next_followup_question(
     Generate the next follow-up MCQ:
       0) Fast-path: consume _pending_next_question from the combined call
          (validates through QuestionCritic — Jaccard + feature + option-overlap)
-      1) Strategist (rule-based disease discriminator)
-      2) Writer (LLM) with strategist hint
-      3) Contextual fallback
+      1) Writer (LLM)
+      2) Contextual fallback
     """
     del max_retries
     if not isinstance(patient_state, dict):
@@ -104,12 +106,27 @@ def get_next_followup_question(
     if turn_count >= MAX_FOLLOWUP_QUESTIONS:
         return "Ready for diagnosis"
 
+    from followup.selection import can_stop_early, should_stop_now
+
+    # ── Early stop ────────────────────────────────────────────────────────────
+    # 1) The combined analyzer signalled ready last turn → honor if the tracked
+    #    state corroborates (double-gate).
+    llm_ready = bool(patient_state.pop("_llm_ready_for_diagnosis", False))
+    if llm_ready and can_stop_early(patient_state, turn_count):
+        patient_state.pop("_pending_next_question", None)
+        return "Ready for diagnosis"
+    # 2) Autonomous: evidence conclusive (High top, Low runner-up, conf >= .85)
+    #    even if the LLM kept proposing confirmatory questions.
+    if should_stop_now(patient_state, turn_count):
+        patient_state.pop("_pending_next_question", None)
+        return "Ready for diagnosis"
+
     # ── Fast-path: use pre-generated question from combined call ─────────────
     pending = patient_state.pop("_pending_next_question", None)
     if isinstance(pending, dict) and pending.get("Question"):
         # Check early-stop flag first (shouldn't appear here but guard anyway)
         if bool(pending.get("ready_for_diagnosis")):
-            if turn_count >= MIN_FOLLOWUP_QUESTIONS:
+            if can_stop_early(patient_state, turn_count):
                 return "Ready for diagnosis"
         else:
             # Validate through the full critic chain before trusting the LLM
@@ -146,13 +163,7 @@ def get_next_followup_question(
                         )
             # Fall through to standard generation chain below
 
-    # ── Standard chain: Strategist → LLM Writer → Contextual Fallback ───────
-    rule_mcq = plan_next_question(patient_state)
-    if isinstance(rule_mcq, str) and "ready for diagnosis" in rule_mcq.lower():
-        return "Ready for diagnosis"
-    if isinstance(rule_mcq, dict) and rule_mcq.get("Question"):
-        return _finalize_mcq(rule_mcq, "strategist_rule")
-
+    # ── Standard chain: LLM Writer → Contextual Fallback ────────────────────
     llm_mcq = _generate_llm_question(patient_state)
     if isinstance(llm_mcq, str) and "ready for diagnosis" in llm_mcq.lower():
         return "Ready for diagnosis"
@@ -182,20 +193,39 @@ def _finalize_mcq(mcq: Dict, source: str) -> Dict:
     return mcq
 
 
-def _generate_llm_question(patient_state: Dict) -> Union[Dict, str, None]:
+def regenerate_llm_question(patient_state: Dict, rejected_candidate=None) -> Union[Dict, None]:
+    """Re-ask the LLM writer for a DIFFERENT high-yield question after the outer
+    critic rejected the primary one — used by selection.py so a rejection at,
+    say, Q8 still yields an information-gain question instead of falling straight
+    to a generic static template. Excludes the rejected dimension and nudges the
+    model toward a distinctly different discriminator.
+    """
+    avoid = []
+    if isinstance(rejected_candidate, dict):
+        fid = str(rejected_candidate.get("feature_id", "")).strip().lower()
+        if fid:
+            avoid.append(fid)
+    result = _generate_llm_question(patient_state, avoid_dimensions=avoid, diversify=True, temperature=0.35)
+    if isinstance(result, dict) and result.get("Question"):
+        result["question_source"] = "llm_retry"
+        return _finalize_mcq(result, "llm_retry")
+    return None
+
+
+def _generate_llm_question(patient_state: Dict, avoid_dimensions=None, diversify: bool = False,
+                           temperature: float = 0.2) -> Union[Dict, str, None]:
     from utils.gemini_api_manager import get_gemini_model
 
     model_available, _model = get_gemini_model()
     if not model_available:
         return None
 
-    strategy_hint = build_strategy_context(patient_state)
-    prompt = build_followup_writer_prompt(patient_state, strategy_hint)
+    prompt = build_followup_writer_prompt(patient_state, avoid_dimensions=avoid_dimensions, diversify=diversify)
 
     success, raw_text, error = generate_content_with_fallback(
         prompt=prompt,
         max_retries=None,
-        temperature=0.2,
+        temperature=temperature,
         max_output_tokens=500,
     )
     if not success or not raw_text:
@@ -217,6 +247,13 @@ def _generate_llm_question(patient_state: Dict) -> Union[Dict, str, None]:
     ok, reason = validate_mcq_quality(normalized, patient_state)
     if not ok:
         logger.warning("writer: LLM MCQ rejected (%s)", reason)
+        return None
+
+    symptom_state = patient_state.get("symptom_state") if isinstance(patient_state.get("symptom_state"), dict) else {}
+    asked_qs = symptom_state.get("questions_asked", [])
+    ok_critic, critic_reason = QuestionCritic(symptom_state).validate_with_reason(normalized, asked_qs)
+    if not ok_critic:
+        logger.warning("writer: LLM MCQ rejected by critic (%s)", critic_reason)
         return None
 
     normalized.setdefault("question_source", "llm")

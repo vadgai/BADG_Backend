@@ -48,6 +48,14 @@ from auth.dependencies import optional_user
 from billing import entitlements as billing_entitlements
 from billing import anon_entitlements
 
+# Defense-in-depth: in-memory per-IP rate limiting (100 req/min by default,
+# see config.py Settings.rate_limit_requests/_window). Only this one of the
+# middleware.py classes is wired in — SecurityHeadersMiddleware's CSP would
+# need to be tailored against /docs (Swagger UI CDN assets) before it's safe
+# to enable globally, and HealthCheckMiddleware/CORSSecurityMiddleware would
+# duplicate the app's own /health route and the CORSMiddleware below.
+from middleware import RateLimitMiddleware
+
 # Import new modules (commented out until modules are created)
 # from models import DiagnosisRequest, DiagnosisResponse, ErrorResponse, HealthCheckResponse
 # from config import get_settings, get_cors_origins
@@ -105,6 +113,14 @@ allowed = os.getenv(
 )
 ALLOWED_ORIGINS = [origin.strip() for origin in allowed.split(",") if origin.strip()]
 
+# Middleware order matters: Starlette runs the LAST-added middleware first
+# (outermost). CORSMiddleware must be added AFTER RateLimitMiddleware so it
+# wraps the limiter — otherwise the limiter's 429 short-circuits before CORS
+# decorates it, and the browser reports a CORS failure (net::ERR_FAILED /
+# "Failed to fetch") instead of a 429 the frontend can actually handle. As the
+# outermost layer, CORS also answers OPTIONS preflights itself, so preflights
+# no longer consume rate-limit budget.
+app.add_middleware(RateLimitMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -536,6 +552,27 @@ async def submit_symptom(
                 },
             )
 
+        # Logged-in users must have a free report or a paid credit remaining
+        # BEFORE the diagnosis starts. Without this gate a user with an exhausted
+        # balance runs the entire follow-up questionnaire (many LLM calls) only to
+        # be blocked at report time — wasted work, and the failure surfaces late as
+        # a confusing error. Gating here means no session is created and no
+        # follow-up questions are generated. This is the authoritative, server-side
+        # enforcement; the /generate_report 402 remains as defense-in-depth for a
+        # balance drained mid-session (e.g. a second tab). get_balance is a pure
+        # read (no consumption) — credits are only spent once a report succeeds.
+        if current_user:
+            balance = billing_entitlements.get_balance(current_user)
+            if not balance.get("reports_available"):
+                raise HTTPException(
+                    status_code=402,
+                    detail={
+                        "code": "no_reports_remaining",
+                        "message": "You have no credits left. Please purchase credits to continue.",
+                        "balance": balance,
+                    },
+                )
+
         # Log the incoming request
         logger.info("Processing symptom submission: name=%s age=%s gender=%s",
                    payload.name, payload.age, payload.gender)
@@ -645,21 +682,82 @@ async def options_session(session_id: str):  # pylint: disable=unused-argument
 
 @app.get("/session/{session_id}")
 async def get_session_data(session_id: str):
-    """Get session data by ID."""
+    """
+    Get session data by ID — also the resume endpoint the frontend calls on
+    mount (after a refresh/reload/reopen) to restore the diagnosis flow to
+    exactly where the patient left off, without re-asking anything already
+    answered.
+
+    Returns everything needed to reconstruct the UI in one round trip:
+    a computed `current_step`, the full Q&A transcript, the pending question
+    (if the follow-up loop was mid-flow), and the report cache/unlock status.
+    """
     try:
         session = await get_or_restore_session(session_id, session_store)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
+
+        patient_state = session.get("patient_state") if isinstance(session.get("patient_state"), dict) else {}
+        # patient_state["chat_history"] is the live, structured-state Q&A
+        # transcript kept up to date every turn; the top-level session
+        # "chat_history" field is retained only for legacy compatibility and
+        # is never populated by the v5 follow-up loop.
+        chat_history = (
+            patient_state.get("chat_history")
+            if isinstance(patient_state.get("chat_history"), list)
+            else session.get("chat_history", [])
+        )
+        question_count = session.get("question_count", 0)
+        report_generated = bool(session.get("report_generated"))
+        cached_reports = session.get("cached_reports") if isinstance(session.get("cached_reports"), dict) else {}
+        last_options = session.get("last_options") if isinstance(session.get("last_options"), dict) else None
+
+        if report_generated or cached_reports:
+            current_step = "report"
+        elif question_count >= MAX_FOLLOWUP_QUESTIONS:
+            current_step = "ready_for_report"
+        elif question_count > 0:
+            current_step = "followup"
+        else:
+            current_step = "symptom_card_or_followup"  # frontend decides card_initial vs followup
+
+        last_question = None
+        if isinstance(last_options, dict) and last_options.get("Question") and current_step == "followup":
+            last_question = {
+                "question": last_options.get("Question"),
+                "options": [
+                    {"key": k, "value": last_options[k]}
+                    for k in ("A", "B", "C", "D", "E")
+                    if k in last_options
+                ],
+                "allow_other": bool(last_options.get("allow_other", True)),
+                "feature_id": last_options.get("feature_id"),
+                "question_source": last_options.get("question_source"),
+            }
 
         return {
             "session_id": session_id,
             "name": session.get("name", "Unknown"),
             "age": session.get("age"),
             "gender": session.get("gender", "unknown"),
+            "weight": session.get("weight"),
+            "height": session.get("height"),
+            "occupation": session.get("occupation"),
+            "location": session.get("location"),
+            "physical_activity": session.get("physical_activity"),
+            "diet_type": session.get("diet_type"),
             "symptoms": session.get("symptoms", []),
-            "chat_history": session.get("chat_history", []),
+            "identified_symptoms": patient_state.get("identified_symptoms", []),
+            "negatives": patient_state.get("negatives", []),
+            "chat_history": chat_history,
             "symptom_state": session.get("symptom_state", {}),
-            "question_count": session.get("question_count", 0),
+            "question_count": question_count,
+            "midpoint_card_shown": bool(session.get("midpoint_card_shown")),
+            "last_question": last_question,
+            "current_step": current_step,
+            "report_generated": report_generated,
+            "report_language": session.get("report_language"),
+            "available_report_languages": sorted(cached_reports.keys()) if cached_reports else [],
             "created_at": session.get("created_at"),
             "last_activity": session.get("last_activity")
         }
@@ -794,6 +892,22 @@ async def generate_report(
         # has since been spent elsewhere. Skip the gates entirely in that case.
         already_unlocked = await billing_entitlements.session_already_unlocked(session_id)
 
+        # Serve a previously generated report as-is on any repeat fetch (page
+        # refresh, PDF export, duplicate tab, switching back to a language
+        # already viewed) — never re-run the LLM pipeline for a report that
+        # already exists. Re-generating would not only waste an LLM call but
+        # could return DIFFERENT wording/diagnosis text than what the patient
+        # already saw, breaking "resume exactly where you left off".
+        _cache_probe_session = session_store.get(session_id) or {}
+        _cached_reports = (
+            _cache_probe_session.get("cached_reports")
+            if isinstance(_cache_probe_session.get("cached_reports"), dict)
+            else {}
+        )
+        _cached_response = _cached_reports.get(lang)
+        if isinstance(_cached_response, dict):
+            return JSONResponse(content=_cached_response, status_code=200)
+
         if current_user:
             # --- Peek only: fail fast if nothing is left, don't consume yet ---
             if not already_unlocked:
@@ -803,7 +917,7 @@ async def generate_report(
                         status_code=402,
                         detail={
                             "code": "no_reports_remaining",
-                            "message": "No credits left. Please purchase more credits to generate another diagnosis report.",
+                            "message": "Your free report limit has been reached. Please purchase credits to generate additional diagnosis reports.",
                             "balance": balance_peek,
                         },
                     )
@@ -1171,8 +1285,6 @@ async def generate_report(
             session["report_generated"] = True
             session["report_timestamp"] = datetime.utcnow().isoformat()
             session["report_language"] = lang
-            await save_session(session_id, session)
-
 
             session_location = session.get("location") if isinstance(session.get("location"), dict) else {}
             response_data = {
@@ -1192,6 +1304,15 @@ async def generate_report(
                 "language": lang,
                 "generated_at": datetime.utcnow().isoformat()
             }
+
+            # Cache the fully-built response so a page refresh, PDF export, or
+            # duplicate request for this (session_id, lang) is served instantly
+            # from here on, without ever calling the LLM again.
+            cached_reports = session.get("cached_reports") if isinstance(session.get("cached_reports"), dict) else {}
+            cached_reports[lang] = response_data
+            session["cached_reports"] = cached_reports
+            await save_session(session_id, session)
+
             return JSONResponse(content=response_data, status_code=200)
         else:
             raise HTTPException(status_code=500, detail="Failed to generate medical report")

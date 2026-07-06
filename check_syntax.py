@@ -3,7 +3,6 @@ import ast, sys, os
 
 files = [
     "app.py",
-    "diagnosis_rule_engine.py",
     "diagnosis_rule_engine_v5.py",
     os.path.join("diagnosis_report", "report.py"),
     os.path.join("diagnosis_methods", "state_followup.py"),

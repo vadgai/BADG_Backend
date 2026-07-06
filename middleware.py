@@ -150,24 +150,32 @@ class LoggingMiddleware(BaseHTTPMiddleware):
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """Simple in-memory rate limiting middleware."""
-    
+
+    # Never counted or blocked: health probes (Cloud Run pings these
+    # continuously) and CORS preflights (also skipped by ordering when CORS
+    # is the outer middleware — this is belt-and-braces).
+    EXEMPT_PATHS = {"/health", "/healthz", "/readiness"}
+
     def __init__(self, app: ASGIApp):
         super().__init__(app)
         self.requests: Dict[str, list] = {}
         self.cleanup_interval = 60  # Clean up old entries every 60 seconds
         self.last_cleanup = time.time()
-    
+
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         """Check rate limit for request."""
+        if request.method == "OPTIONS" or request.url.path in self.EXEMPT_PATHS:
+            return await call_next(request)
+
         # Clean up old entries periodically
         current_time = time.time()
         if current_time - self.last_cleanup > self.cleanup_interval:
             self._cleanup_old_entries(current_time)
             self.last_cleanup = current_time
-        
+
         # Get client IP
         client_ip = request.client.host if request.client else "unknown"
-        
+
         # Check rate limit
         if self._is_rate_limited(client_ip, current_time):
             return JSONResponse(
@@ -175,12 +183,13 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 content={
                     "error": "Rate limit exceeded",
                     "detail": "Too many requests. Please try again later."
-                }
+                },
+                headers={"Retry-After": str(settings.rate_limit_window)},
             )
-        
+
         # Record request
         self._record_request(client_ip, current_time)
-        
+
         return await call_next(request)
     
     def _is_rate_limited(self, client_ip: str, current_time: float) -> bool:

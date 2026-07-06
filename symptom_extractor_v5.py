@@ -72,6 +72,28 @@ _MODIFIER_KEYS = (
     "associated_symptoms",
 )
 
+# Matches a bare internal identifier (e.g. a follow-up feature_id like
+# "gradual_onset"/"caffeine_intake" or an MCQ option key) that occasionally
+# leaks through as if it were the patient's answer text, instead of the
+# option's human-readable display text. Natural clinical language never
+# contains underscores, so this pattern is safe to treat as "not a real
+# finding" and humanize rather than store verbatim.
+_SNAKE_CASE_TOKEN = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)+$")
+
+
+def humanize_internal_token(value: Any) -> str:
+    """
+    Convert a leaked internal identifier ("duration_less_than_one_month") into
+    plain readable text ("duration less than one month"). Ordinary
+    natural-language findings are returned unchanged.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return text
+    if _SNAKE_CASE_TOKEN.match(text.lower()):
+        return re.sub(r"_+", " ", text).strip()
+    return text
+
 
 def extract_initial_symptoms(
     symptoms_text: str,
@@ -127,6 +149,7 @@ def _normalize_term(value: Any) -> str:
     term = str(value).strip().lower()
     if not term:
         return ""
+    term = humanize_internal_token(term)
     term = re.sub(r"\s+", " ", term)
     if term in _NORMALIZATION_MAP:
         return _NORMALIZATION_MAP[term]
@@ -496,9 +519,9 @@ def apply_signals_to_state(
     if not isinstance(patient_state, dict):
         return patient_state
 
-    positives = signals.get("new_positive_findings") or []
-    negatives = signals.get("new_negative_findings") or []
-    red_flags = signals.get("red_flags_detected") or []
+    positives = [humanize_internal_token(item) for item in (signals.get("new_positive_findings") or [])]
+    negatives = [humanize_internal_token(item) for item in (signals.get("new_negative_findings") or [])]
+    red_flags = [humanize_internal_token(item) for item in (signals.get("red_flags_detected") or [])]
     incoming_modifier_map = signals.get("modifier_map") if isinstance(signals.get("modifier_map"), dict) else {}
     incoming_modifiers = signals.get("modifiers") if isinstance(signals.get("modifiers"), list) else []
 

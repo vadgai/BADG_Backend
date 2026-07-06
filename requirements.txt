@@ -26,8 +26,16 @@ pymongo>=4.6.1
 dnspython>=2.6.1
 
 # Security & Authentication
+# passlib 1.7.4 (last released 2020) detects its bcrypt backend via
+# bcrypt.__about__.__version__, which bcrypt>=4.1 removed — passlib[bcrypt]
+# alone doesn't pin bcrypt, so an unpinned `pip install` (e.g. a fresh Docker
+# build) resolves to whatever the latest bcrypt is and crashes every
+# hash_password()/verify_password() call with
+# "AttributeError: module 'bcrypt' has no attribute '__about__'". Pin bcrypt
+# to the version already proven working in local dev.
 PyJWT>=2.8.0
 passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
 python-jose[cryptography]==3.3.0
 
 # AI & NLP Libraries

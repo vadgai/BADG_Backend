@@ -14,7 +14,7 @@ import logging
 from datetime import datetime
 from typing import Dict, Optional
 
-from database.connection import get_database
+from database.connection import get_database, wait_if_connecting
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +64,22 @@ def _json_safe(value):
 
 
 async def save_session(session_id: str, session: dict) -> None:
-    """Upsert a session snapshot to MongoDB. Failures are logged, never raised."""
+    """Upsert a session snapshot to MongoDB. Failures are logged, never raised.
+
+    A freshly cold-started Cloud Run instance starts serving traffic before
+    its background MongoDB connect finishes (see app.py's _background_init).
+    A session created during that window would otherwise only ever exist in
+    THIS instance's in-memory session_store — Cloud Run doesn't guarantee a
+    later request for the same session_id (a symptom-card fetch, the
+    follow-up websocket) lands on the same instance, so it would come back
+    as a 404 for a session the user just created. Wait out that specific
+    window (bounded) before giving up, rather than silently dropping the
+    write the moment `col is None`.
+    """
     col = _collection()
+    if col is None:
+        await wait_if_connecting()
+        col = _collection()
     if col is None or not isinstance(session, dict):
         return
     try:
@@ -79,8 +93,17 @@ async def save_session(session_id: str, session: dict) -> None:
 
 
 async def load_session(session_id: str) -> Optional[dict]:
-    """Fetch a persisted session, or None if absent/unavailable."""
+    """Fetch a persisted session, or None if absent/unavailable.
+
+    Same cold-start race as save_session: if THIS instance is the one
+    handling the restore attempt and its own MongoDB connection is still
+    coming up, wait that out rather than reporting "not found" for a session
+    that may well be sitting in MongoDB already.
+    """
     col = _collection()
+    if col is None:
+        await wait_if_connecting()
+        col = _collection()
     if col is None:
         return None
     try:

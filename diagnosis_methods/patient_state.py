@@ -152,21 +152,27 @@ def update_patient_state(
     
     # If AI analysis is provided, use it to update state
     if ai_analysis:
+        from symptom_extractor_v5 import humanize_internal_token
+
         # Update identified symptoms
         if "identified_symptoms" in ai_analysis:
             new_symptoms = ai_analysis["identified_symptoms"]
             existing = set(state.get("identified_symptoms", []))
             for symptom in new_symptoms:
-                if symptom not in existing:
+                symptom = humanize_internal_token(symptom)
+                if symptom and symptom not in existing:
                     state["identified_symptoms"].append(symptom)
-        
+                    existing.add(symptom)
+
         # Update negatives (ruled out symptoms/conditions)
         if "negatives" in ai_analysis:
             new_negatives = ai_analysis["negatives"]
             existing_negatives = set(state.get("negatives", []))
             for negative in new_negatives:
-                if negative not in existing_negatives:
+                negative = humanize_internal_token(negative)
+                if negative and negative not in existing_negatives:
                     state["negatives"].append(negative)
+                    existing_negatives.add(negative)
         
         # Update suspected conditions (deprecated, kept for compatibility)
         if "suspected_conditions" in ai_analysis:

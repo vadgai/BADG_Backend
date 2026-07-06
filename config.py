@@ -45,8 +45,10 @@ class Settings(BaseSettings):
     secret_key: str = Field(default="", description="Secret key (required via SECRET_KEY env var)")
     access_token_expire_minutes: int = Field(default=30, description="Token expiration time")
     
-    # Rate Limiting
-    rate_limit_requests: int = Field(default=100, description="Rate limit requests per minute")
+    # Rate Limiting. Per-IP, so the default must survive shared IPs: an SPA
+    # session makes bursts of API calls, and NAT'd users (offices, campuses)
+    # share one address. The old 100/min throttled normal single-user dev use.
+    rate_limit_requests: int = Field(default=300, description="Rate limit requests per minute")
     rate_limit_window: int = Field(default=60, description="Rate limit window in seconds")
     
     # Session Configuration

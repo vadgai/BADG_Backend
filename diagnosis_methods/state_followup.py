@@ -18,11 +18,9 @@ load_dotenv()
 
 from utils.gemini_api_manager import generate_content_with_fallback, extract_json_from_text
 from diagnosis_methods.patient_state import state_to_prompt_string
-from diagnosis_rule_engine import analyze_case, load_diseases_from_folder, build_disease_profiles, DISEASE_PROFILES
 
 logger = logging.getLogger(__name__)
 _DIAG_V6_QUESTION_PLANNER = str(os.getenv("DIAG_V6_QUESTION_PLANNER", "true")).strip().lower() in {"1", "true", "yes", "on"}
-_PROFILES_READY = False
 
 _PLACEHOLDER_MARKERS = {
     "clinically precise question",
@@ -148,42 +146,6 @@ def _is_repeated_question(question: str, asked_questions: List[str]) -> bool:
     return is_repeated_question(question, asked_questions)
 
 
-def _extract_top_two_condition_names(patient_state: Dict) -> List[str]:
-    differential = patient_state.get("differential_diagnosis")
-    names: List[str] = []
-    if isinstance(differential, list):
-        for item in differential:
-            if isinstance(item, dict):
-                name = str(item.get("name", "")).strip()
-                if name:
-                    names.append(name)
-            if len(names) >= 2:
-                break
-    return names
-
-
-def _ensure_profiles_loaded() -> None:
-    global _PROFILES_READY
-    if _PROFILES_READY and DISEASE_PROFILES:
-        return
-    load_diseases_from_folder()
-    build_disease_profiles()
-    _PROFILES_READY = True
-
-
-def _extract_profile_by_name(condition_name: str) -> Optional[Dict]:
-    target = _normalize_text(condition_name)
-    if not target:
-        return None
-    for profile in DISEASE_PROFILES:
-        name = _normalize_text(profile.get("name", ""))
-        if not name:
-            continue
-        if name == target or name in target or target in name:
-            return profile
-    return None
-
-
 def _known_findings_set(patient_state: Dict) -> set:
     positives = patient_state.get("identified_symptoms") if isinstance(patient_state.get("identified_symptoms"), list) else []
     negatives = patient_state.get("negatives") if isinstance(patient_state.get("negatives"), list) else []
@@ -195,42 +157,6 @@ def _known_findings_set(patient_state: Dict) -> set:
     return known
 
 
-def _feature_terms(profile: Dict, bucket: str) -> List[Dict[str, Union[str, float]]]:
-    terms: List[Dict[str, Union[str, float]]] = []
-    features = profile.get("features", {}).get(bucket, []) if isinstance(profile.get("features"), dict) else []
-    if isinstance(features, list) and features:
-        for feature in features:
-            if isinstance(feature, dict):
-                term = _normalize_text(feature.get("term"))
-                if not term:
-                    continue
-                try:
-                    weight = float(feature.get("weight", 1.0))
-                except (TypeError, ValueError):
-                    weight = 1.0
-                terms.append({"term": term, "weight": max(0.1, weight)})
-        if terms:
-            return terms
-
-    # Backward compatibility if features are missing.
-    if bucket == "key":
-        terms_raw = profile.get("symptoms", {}).get("required", []) if isinstance(profile.get("symptoms"), dict) else []
-        terms.extend({"term": _normalize_text(item), "weight": 1.0} for item in terms_raw if _normalize_text(item))
-    elif bucket == "supportive":
-        terms_raw = profile.get("symptoms", {}).get("common", []) if isinstance(profile.get("symptoms"), dict) else []
-        terms.extend({"term": _normalize_text(item), "weight": 0.6} for item in terms_raw if _normalize_text(item))
-    elif bucket == "rare":
-        terms_raw = profile.get("symptoms", {}).get("rare", []) if isinstance(profile.get("symptoms"), dict) else []
-        terms.extend({"term": _normalize_text(item), "weight": 0.35} for item in terms_raw if _normalize_text(item))
-    return terms
-
-
-def _semantic_topic_from_feature(feature: str) -> str:
-    cleaned = re.sub(r"[^a-z0-9 ]", " ", feature.lower())
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned
-
-
 def _plainify(term: str) -> str:
     """Map a clinical feature term to plain patient-facing wording (shared map)."""
     try:
@@ -238,162 +164,6 @@ def _plainify(term: str) -> str:
         return _plain_label(term)
     except Exception:
         return str(term or "").strip().lower()
-
-
-def _build_deterministic_question_from_feature(
-    feature_term: str,
-    opposite_term: str,
-    top_two: List[str],
-    priority: str,
-) -> Dict[str, str]:
-    disease_1 = top_two[0] if len(top_two) > 0 else "Top diagnosis"
-    disease_2 = top_two[1] if len(top_two) > 1 else "Alternate diagnosis"
-    feature_label = _plainify(feature_term)
-    opposite_label = _plainify(opposite_term) if opposite_term else "a different competing pattern"
-    return {
-        "Question": f"Do you have {feature_label}?",
-        "A": f"Yes, I have {feature_label}",
-        "B": f"No, it's more like {opposite_label}",
-        "C": "Neither of these fits",
-        "D": f"Not sure about {feature_label}",
-        "E": "None of these / Not sure",
-        "allow_other": True,
-        "priority": priority,
-        "clinical_intent": f"Differentiate {disease_1} vs {disease_2} using feature-level evidence",
-        "differentiates_between": [disease_1, disease_2],
-        "feature_id": feature_label,
-        "question_source": "deterministic",
-    }
-
-
-def _deterministic_top2_and_feature(patient_state: Dict) -> Optional[Dict[str, Any]]:
-    _ensure_profiles_loaded()
-    demographics = patient_state.get("demographics") if isinstance(patient_state.get("demographics"), dict) else {}
-    age = demographics.get("age")
-    gender = demographics.get("gender")
-    positives = patient_state.get("identified_symptoms") if isinstance(patient_state.get("identified_symptoms"), list) else []
-    negatives = patient_state.get("negatives") if isinstance(patient_state.get("negatives"), list) else []
-    symptom_state = patient_state.get("symptom_state") if isinstance(patient_state.get("symptom_state"), dict) else {}
-    red_flags = symptom_state.get("red_flags") if isinstance(symptom_state.get("red_flags"), list) else patient_state.get("red_flags", [])
-    modifier_map = symptom_state.get("modifier_map") if isinstance(symptom_state.get("modifier_map"), dict) else symptom_state.get("modifiers")
-
-    if not positives:
-        return None
-
-    ranking = analyze_case(
-        age=age,
-        gender=gender,
-        symptoms=positives,
-        chat_history="Structured state only",
-        negatives=negatives,
-        modifiers=modifier_map,
-        red_flags=red_flags if isinstance(red_flags, list) else [],
-    )
-    conditions = ranking.get("conditions") if isinstance(ranking, dict) else []
-    if not isinstance(conditions, list) or len(conditions) < 1:
-        return None
-    top_condition = conditions[0] if isinstance(conditions[0], dict) else None
-    second_condition = conditions[1] if len(conditions) > 1 and isinstance(conditions[1], dict) else None
-    if not top_condition:
-        return None
-    top_name = str(top_condition.get("name", "")).strip()
-    second_name = str(second_condition.get("name", "")).strip() if second_condition else ""
-    top_two = [name for name in [top_name, second_name] if name]
-    if len(top_two) < 2:
-        # Fall back to current state differential names when rule engine returns one candidate.
-        top_two = _extract_top_two_condition_names(patient_state) or top_two
-    if len(top_two) < 2:
-        return None
-
-    profile_1 = _extract_profile_by_name(top_two[0])
-    profile_2 = _extract_profile_by_name(top_two[1])
-    if not profile_1 or not profile_2:
-        return None
-
-    from followup.constants import JACCARD_REPEAT_THRESHOLD
-
-    asked_questions = _extract_asked_questions(patient_state)
-    known = _known_findings_set(patient_state)
-    red_flag_terms = set(_normalize_text(item) for item in (red_flags if isinstance(red_flags, list) else []) if _normalize_text(item))
-
-    top1_terms = _feature_terms(profile_1, "key") + _feature_terms(profile_1, "supportive") + _feature_terms(profile_1, "rare")
-    top2_terms = _feature_terms(profile_2, "key") + _feature_terms(profile_2, "supportive") + _feature_terms(profile_2, "rare")
-    top2_term_set = {str(item.get("term")) for item in top2_terms if str(item.get("term"))}
-    top1_term_set = {str(item.get("term")) for item in top1_terms if str(item.get("term"))}
-
-    candidates: List[Dict[str, Any]] = []
-    for feature in top1_terms:
-        term = str(feature.get("term", "")).strip()
-        if not term or term in known:
-            continue
-        if term in top2_term_set:
-            continue
-        if any(_jaccard(term, asked) >= JACCARD_REPEAT_THRESHOLD for asked in asked_questions):
-            continue
-        opposite = next((str(item.get("term")) for item in top2_terms if str(item.get("term")) not in known), "")
-        weight = float(feature.get("weight", 1.0) or 1.0)
-        red_priority = any(flag in term or term in flag for flag in red_flag_terms) if red_flag_terms else False
-        separation = 1.0
-        if opposite:
-            separation = max(0.1, 1.0 - _jaccard(term, opposite))
-        novelty = 1.0 if term not in known else 0.0
-        utility = (1.45 * weight) + (1.15 * separation) + (0.7 * novelty) + (1.0 if red_priority else 0.0)
-        candidates.append(
-            {
-                "term": term,
-                "opposite": opposite,
-                "utility": utility,
-                "priority": "red-flag" if red_priority else "high",
-            }
-        )
-
-    for feature in top2_terms:
-        term = str(feature.get("term", "")).strip()
-        if not term or term in known:
-            continue
-        if term in top1_term_set:
-            continue
-        if any(_jaccard(term, asked) >= JACCARD_REPEAT_THRESHOLD for asked in asked_questions):
-            continue
-        opposite = next((str(item.get("term")) for item in top1_terms if str(item.get("term")) not in known), "")
-        weight = float(feature.get("weight", 1.0) or 1.0)
-        red_priority = any(flag in term or term in flag for flag in red_flag_terms) if red_flag_terms else False
-        separation = 1.0
-        if opposite:
-            separation = max(0.1, 1.0 - _jaccard(term, opposite))
-        novelty = 1.0 if term not in known else 0.0
-        utility = (1.35 * weight) + (1.1 * separation) + (0.7 * novelty) + (1.0 if red_priority else 0.0)
-        candidates.append(
-            {
-                "term": term,
-                "opposite": opposite,
-                "utility": utility,
-                "priority": "red-flag" if red_priority else "high",
-            }
-        )
-
-    if not candidates:
-        return {
-            "top_two": top_two,
-            "ranking": ranking,
-            "feature": None,
-            "question": None,
-        }
-
-    candidates.sort(key=lambda item: float(item.get("utility", 0.0)), reverse=True)
-    selected = candidates[0]
-    question = _build_deterministic_question_from_feature(
-        feature_term=str(selected.get("term", "")),
-        opposite_term=str(selected.get("opposite", "")),
-        top_two=top_two,
-        priority=str(selected.get("priority", "high")),
-    )
-    return {
-        "top_two": top_two,
-        "ranking": ranking,
-        "feature": selected,
-        "question": question,
-    }
 
 
 def _build_chief_symptom_mcq(patient_state: Dict) -> Dict[str, str]:
@@ -498,52 +268,14 @@ def _build_core_dimension_mcq(patient_state: Dict, asked_questions: List[str]) -
     }
 
 
-def _build_eig_fallback_mcq(patient_state: Dict) -> Union[Dict, str, None]:
-    """Single-dimension MCQ built from the highest-information-gain finding (no LLM)."""
-    try:
-        from followup.information_gain import select_by_information_gain
-        ig = select_by_information_gain(patient_state)
-    except Exception:
-        return None
-    if not isinstance(ig, dict):
-        return None
-    if ig.get("ready"):
-        from followup.constants import MIN_FOLLOWUP_QUESTIONS
-        if int(patient_state.get("turn_count", 0) or 0) >= MIN_FOLLOWUP_QUESTIONS:
-            return "Ready for diagnosis"
-        # High confidence but below the question floor — keep asking.
-    feature = str(ig.get("feature_term") or "").strip()
-    dimension = str(ig.get("dimension") or "").strip()
-    if not feature or not dimension:
-        return None
-    top_two = ig.get("top_two") or []
-    d1 = top_two[0] if top_two else "the leading diagnosis"
-    d2 = top_two[1] if len(top_two) > 1 else "an alternative"
-    feature = _plainify(feature) or feature
-    return {
-        "Question": f"Do you have {feature}?",
-        "A": f"Yes, {feature}",
-        "B": "No, I don't have that",
-        "C": "Only mild or occasional",
-        "D": "I haven't noticed",
-        "E": "Not sure / None of these",
-        "allow_other": True,
-        "priority": "high",
-        "clinical_intent": f"Differentiate {d1} vs {d2} (highest information gain)",
-        "differentiates_between": [d1, d2],
-        "feature_id": dimension,
-        "question_source": "eig_fallback",
-    }
-
-
 def build_contextual_fallback_mcq(patient_state: Dict) -> Union[Dict, str]:
     """
     Build a single-dimension MCQ fallback when the LLM path is unavailable/rejected.
 
-    Preference order (every option is single-dimension — never a grab-bag):
-      1) highest-information-gain finding over the belief state,
-      2) a mandatory core dimension (duration → severity) if not yet asked,
-      3) a chief-symptom pattern template (single body system).
+    This is the last-resort, no-LLM safety net (used only if the Gemini API is
+    genuinely unreachable), so it deliberately stays registry-free and static:
+      1) a mandatory core dimension (duration → severity) if not yet asked,
+      2) a chief-symptom pattern template (single body system).
     """
     turn_count = int(patient_state.get("turn_count", 0) or 0)
     asked_questions = _extract_asked_questions(patient_state)
@@ -552,19 +284,12 @@ def build_contextual_fallback_mcq(patient_state: Dict) -> Union[Dict, str]:
     if turn_count >= MAX_FOLLOWUP_QUESTIONS:
         return "Ready for diagnosis"
 
-    # 1) Information-gain driven single-dimension question.
-    eig_q = _build_eig_fallback_mcq(patient_state)
-    if isinstance(eig_q, str) and "ready" in eig_q.lower():
-        return "Ready for diagnosis"
-    if isinstance(eig_q, dict) and not _is_repeated_question(eig_q.get("Question", ""), asked_questions):
-        return eig_q
-
-    # 2) Mandatory core dimension (duration/severity) if still uncovered.
+    # 1) Mandatory core dimension (duration/severity) if still uncovered.
     core_q = _build_core_dimension_mcq(patient_state, asked_questions)
     if not _is_repeated_question(core_q.get("Question", ""), asked_questions):
         return core_q
 
-    # 3) Chief-symptom pattern template (single body system).
+    # 2) Chief-symptom pattern template (single body system).
     fallback = _build_chief_symptom_mcq(patient_state)
     return fallback
 
@@ -593,7 +318,6 @@ def analyze_answer_for_state(
     question: str,
     answer: str,
     current_state: Dict,
-    strategy_hint: str = "",
 ) -> Optional[Dict]:
     """
     Analyze a patient's answer AND generate the next MCQ question in a single
@@ -603,7 +327,6 @@ def analyze_answer_for_state(
         question: The question that was asked
         answer: The patient's answer
         current_state: Current patient state
-        strategy_hint: Optional hint from the Strategist agent (rule-based)
 
     Returns:
         Dictionary with:
@@ -627,7 +350,7 @@ def analyze_answer_for_state(
                         This enforcement reads from state, not the prompt, so
                         trimming the prompt does not weaken it.
       Layer 3 — Fallback: if Layer 2 rejects the question, orchestrator falls
-                          through to the existing strategist → writer chain.
+                          through to the LLM writer → contextual fallback chain.
     """
     from utils.gemini_api_manager import get_gemini_model
     model_available, model = get_gemini_model()
@@ -703,6 +426,7 @@ def analyze_answer_for_state(
     # The Python critic still enforces no-repeat from symptom_state (Jaccard on
     # questions_asked + feature_id dedup), so this only trims prompt tokens.
     from followup.constants import (
+        EARLY_STOP_MIN_QUESTIONS,
         FOLLOWUP_DIMENSIONS,
         MAX_FOLLOWUP_QUESTIONS,
         MIN_FOLLOWUP_QUESTIONS,
@@ -714,35 +438,9 @@ def analyze_answer_for_state(
     remaining = [d for d in FOLLOWUP_DIMENSIONS if d not in covered]
     remaining_text = ", ".join(remaining) or "any unasked clinical dimension"
 
-    # ── EIG shortlist + posterior anchor (pure computation, zero LLM tokens) ──
-    # Offering the model every unasked dimension invites generic screening
-    # questions; instead offer only the few highest-information-gain dimensions.
-    # The posterior anchor keeps PART 1's differential consistent with the
-    # Bayesian belief state so it cannot drift to diseases whose key symptoms
-    # the patient already denied (e.g. GERD after "No" to all reflux questions).
-    anchor_line = ""
-    try:
-        from followup.information_gain import rank_candidate_findings
-        eig_ranked = rank_candidate_findings(current_state, top_k=6, limit=5)
-    except Exception:
-        eig_ranked = None
-    if isinstance(eig_ranked, dict):
-        eig_findings = eig_ranked.get("findings") or []
-        if eig_findings:
-            remaining_text = ", ".join(
-                f"{f['dimension']} (e.g. {f['term']})" for f in eig_findings[:5]
-            ) + " — ranked by information gain; prefer the first that fits"
-        posterior_map = eig_ranked.get("posterior") or {}
-        if posterior_map:
-            anchor_line = (
-                "\nComputed posterior (rule engine + all evidence so far): "
-                + ", ".join(f"{n} {p:.0%}" for n, p in list(posterior_map.items())[:3])
-            )
-
     # ── Optional contextual lines ───────────────────────────────────────────
     summary_line = f"\nClinical summary so far: {running_summary[:200]}" if running_summary else ""
     differentiator_line = f"\nKey differentiator to confirm: {differentiator}" if differentiator else ""
-    strategy_line = f"\nStrategist hint: {strategy_hint}" if strategy_hint else ""
 
     # ── Build combined prompt (compact) ──────────────────────────────────────
     prompt = f"""Clinical diagnostician. Update the diagnostic state from the latest answer, then ask the single best next question, like an experienced doctor narrowing a differential. JSON only.
@@ -752,28 +450,32 @@ PATIENT {age}/{gender}{bmi_text} | Chief: {chief_complaint}
 -Ruled out: {negatives_text}
 Red flags: {red_flags_text}
 Modifiers: {json.dumps(modifier_map, ensure_ascii=False)}
-Turn {turn_count + 1}/{MAX_FOLLOWUP_QUESTIONS}{summary_line}{differentiator_line}{strategy_line}
-Differential: {diff_text}{anchor_line}
+Turn {turn_count + 1}/{MAX_FOLLOWUP_QUESTIONS}{summary_line}{differentiator_line}
+Differential: {diff_text}
 Latest — Q: {question} | A: {answer}
 
 PART 1 — update state:
 - New findings → identified_symptoms; denied/absent → negatives. Store SHORT clinical terms only — never question text or a sentence. If the answer CONTRADICTS a prior finding (e.g. denies a symptom already in Confirmed), move it to negatives and remove it from findings — never keep both.
 - confidence_score 0-1. Rank EXACTLY 3 differentials (name, confidence High>=70%/Moderate 50-70%/Low<50%, 1-line reasoning tied to findings+negatives). Weigh acuity: chronic course (weeks + weight loss/night sweats) argues against acute conditions. Use age/sex as a prior. Apply India-endemic context ONLY when the reported findings support it — never list an endemic disease (TB, dengue, typhoid, pertussis) unless the patient's positives clearly point to it.
-- STAY CONSISTENT with the computed posterior above: re-rank only when the latest answer clearly changes the evidence. A disease whose key symptoms the patient DENIED must never rank in the top 2.
+- Reason independently from the evidence using standard clinical judgment: re-rank whenever the accumulated findings support a better differential, using your own medical knowledge rather than anchoring to any prior list. A disease whose key symptoms the patient DENIED must never rank in the top 2.
+- WEIGHT BY SPECIFICITY: a hallmark/near-specific finding (e.g. pain behind the eyes → dengue over chikungunya, right-shoulder pain radiation → biliary over gastric) outweighs a nonspecific symptom both suspects share (e.g. fever, body ache). Do NOT let one shared symptom flip the ranking. Do NOT upgrade to a chronic/inflammatory label (e.g. "chronic cholecystitis") without an inflammatory sign (fever, tenderness) — recurrent episodes alone with no inflammation stay the simpler diagnosis.
 - differentiator_symptom = the feature best separating #1 vs #2. running_summary = 2 short clinical sentences.
 
 PART 2 — next question (skip if stopping):
+- MAXIMUM INFORMATION GAIN: before writing, decide which SINGLE still-unknown finding would most change the ranking between #1 and #2 if answered — a finding expected in one but NOT the other. Ask THAT. If a dimension's answer would leave the top-2 unchanged either way, do not ask it.
+- PATHOGNOMONIC FIRST: if either top suspect has an unasked hallmark finding (pain behind the eyes for dengue, right-shoulder radiation for gallstones, one-sided weakness for stroke), ask THAT before any nonspecific shared symptom.
 - feature_id = ONE unused dimension from: {remaining_text}
 - Already covered, never re-ask: {covered_text}
+- History/exposure dimensions (family_history, travel_history, comorbidities, medications, tb_exposure, sick_contacts) ONLY if they directly separate the current top-2 — never as routine screening.
 - Probe EXACTLY ONE dimension. A-D are mutually-exclusive ANSWERS to that single question (levels/variants of it), NOT a list of different symptoms — never bundle multiple screening topics into one question. E = "Not sure / None of these".
-- Split the top 2 differentials. Cover still-missing high-yield axes first (duration/onset, then red-flag, severity, quality/location). Use age/sex to pick demographic-specific dimensions (e.g. menstrual_pregnancy for a reproductive-age female with lower-abdominal pain). 5-10 words.
+- Cover still-missing high-yield axes first (duration/onset, then red-flag, severity, quality/location). Use age/sex to pick demographic-specific dimensions (e.g. menstrual_pregnancy for a reproductive-age female with lower-abdominal pain). 5-10 words.
 - Plain language for a patient with no medical background: everyday words only, never clinical/technical terms (say "trouble breathing" not "dyspnea", "throwing up" not "emesis", "coughing up blood" not "hemoptysis"). Question: 5-10 words. Each option A-D: a short, concrete phrase, 2-6 words.
 
-EARLY STOP: only if turn >= {MAX_FOLLOWUP_QUESTIONS}, OR (turn >= {MIN_FOLLOWUP_QUESTIONS} AND the top suspect is High-confidence with its key differentiators already answered) → return exactly {{"ready_for_diagnosis": true}} and omit next_question. NEVER stop before turn {MIN_FOLLOWUP_QUESTIONS}.
+EARLY STOP: if turn >= {MAX_FOLLOWUP_QUESTIONS}, OR (turn >= {EARLY_STOP_MIN_QUESTIONS} AND the top suspect is High-confidence with confidence_score >= 0.85, its key differentiators already answered, AND no remaining question could realistically change the top 2) → return exactly {{"ready_for_diagnosis": true}} and omit next_question. Never stop before turn {EARLY_STOP_MIN_QUESTIONS}. Do NOT inflate confidence to stop early — an unnecessary question costs less than a wrong diagnosis; by turn {MIN_FOLLOWUP_QUESTIONS}+ prefer stopping once nothing more would change the ranking.
 
 Return JSON in ONE format.
 Continue:
-{{"identified_symptoms":["..."],"negatives":["..."],"confidence_score":0.75,"differential_diagnosis":[{{"name":"...","confidence":"High|Moderate|Low","reasoning":"..."}},{{"name":"...","confidence":"High|Moderate|Low","reasoning":"..."}},{{"name":"...","confidence":"High|Moderate|Low","reasoning":"..."}}],"differentiator_symptom":"...","running_summary":"...","next_question":{{"Question":"...","A":"...","B":"...","C":"...","D":"...","E":"Not sure / None of these","feature_id":"<one_unused_dimension>"}}}}
+{{"identified_symptoms":["..."],"negatives":["..."],"confidence_score":0.75,"differential_diagnosis":[{{"name":"...","confidence":"High|Moderate|Low","reasoning":"..."}},{{"name":"...","confidence":"High|Moderate|Low","reasoning":"..."}},{{"name":"...","confidence":"High|Moderate|Low","reasoning":"..."}}],"differentiator_symptom":"...","running_summary":"...","next_question":{{"Question":"...","A":"...","B":"...","C":"...","D":"...","E":"Not sure / None of these","feature_id":"<one_unused_dimension>","differentiates_between":["<dx1>","<dx2>"],"why":"<how the answer splits dx1 vs dx2, <=12 words>"}}}}
 Stop:
 {{"ready_for_diagnosis": true}}
 """

@@ -3,6 +3,7 @@ MongoDB Database Connection Module
 Uses Motor for async MongoDB operations
 """
 
+import asyncio
 import os
 import logging
 from typing import Optional
@@ -44,6 +45,28 @@ _client: Optional[AsyncIOMotorClient] = None
 _database: Optional[AsyncIOMotorDatabase] = None
 _db_available = False
 
+# Cloud Run starts serving traffic immediately at startup and connects to
+# MongoDB in a background task (app.py's _background_init), so the very
+# first requests an instance handles can land before that connection
+# finishes. This event lets a caller that needs the DB (e.g. persisting a
+# just-created session so OTHER instances can find it — Cloud Run does not
+# guarantee request-to-instance affinity) wait out that specific window
+# instead of silently treating "not connected yet" the same as "no database
+# configured at all". Starts set (idle) so callers never wait when no
+# connection attempt is actually in flight.
+_connecting_event = asyncio.Event()
+_connecting_event.set()
+
+
+async def wait_if_connecting(timeout: float = 8.0) -> None:
+    """If a connect_to_mongodb() call is currently in flight, wait (bounded)
+    for it to finish — success or failure — before returning. A no-op
+    (returns immediately) whenever no connection attempt is in progress."""
+    try:
+        await asyncio.wait_for(_connecting_event.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        pass
+
 
 async def connect_to_mongodb():
     """
@@ -65,9 +88,14 @@ async def connect_to_mongodb():
         _db_available = False
         return False
     
+    # Signal "connecting in progress" so wait_if_connecting() callers (e.g. a
+    # session write that needs the DB to be reachable by every instance, not
+    # just this one) block briefly instead of assuming the DB will never come
+    # up. Always released in `finally`, however this attempt ends.
+    _connecting_event.clear()
     try:
         logger.info("Connecting to MongoDB...")
-        
+
         # Create async MongoDB client
         _client = AsyncIOMotorClient(
             MONGO_URI,
@@ -76,21 +104,21 @@ async def connect_to_mongodb():
             serverSelectionTimeoutMS=5000,  # 5 second timeout
             connectTimeoutMS=10000,  # 10 second connection timeout
         )
-        
+
         # Get database
         _database = _client[MONGO_DB_NAME]
-        
+
         # Test connection with ping
         await _client.admin.command('ping')
-        
+
         _db_available = True
         logger.info("✅ MongoDB connected successfully to database: %s", MONGO_DB_NAME)
-        
+
         # Create indexes
         await create_indexes()
-        
+
         return True
-        
+
     except (ConnectionFailure, ServerSelectionTimeoutError) as e:
         _db_available = False
         logger.error("❌ MongoDB connection failed: %s", str(e))
@@ -101,6 +129,8 @@ async def connect_to_mongodb():
         logger.error("❌ Unexpected error connecting to MongoDB: %s", str(e))
         logger.warning("System will continue with in-memory storage only")
         return False
+    finally:
+        _connecting_event.set()
 
 
 async def close_mongodb_connection():

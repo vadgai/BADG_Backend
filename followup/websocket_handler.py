@@ -8,11 +8,11 @@ from typing import Dict
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from followup.constants import MAX_FOLLOWUP_QUESTIONS, MIN_FOLLOWUP_QUESTIONS
+from followup.constants import MAX_FOLLOWUP_QUESTIONS
 from followup.feature_tracking import record_sent_question
 from followup.fallbacks.turn_templates import build_turn_indexed_question
 from followup.orchestrator import get_next_followup_question, update_state_with_answer
-from followup.selection import select_question_candidate
+from followup.selection import can_stop_early, select_question_candidate
 from followup.session_helpers import (
     ensure_states,
     map_client_answer,
@@ -78,7 +78,7 @@ async def handle_followup_websocket(
             )
 
             if isinstance(selected, str) and "ready for diagnosis" in selected.lower():
-                if question_count >= MIN_FOLLOWUP_QUESTIONS:
+                if can_stop_early(patient_state, question_count):
                     await websocket.send_json({"message": "Diagnosis is ready", "status": "ready_for_diagnosis"})
                     await websocket.close(code=1000, reason="Diagnosis ready")
                     return False
@@ -91,7 +91,7 @@ async def handle_followup_websocket(
                 )
 
             if not (isinstance(selected, dict) and selected.get("Question")):
-                if question_count >= MIN_FOLLOWUP_QUESTIONS:
+                if can_stop_early(patient_state, question_count):
                     await websocket.send_json({"message": "Diagnosis is ready", "status": "ready_for_diagnosis"})
                     await websocket.close(code=1000, reason="Diagnosis ready")
                     return False
@@ -202,6 +202,46 @@ async def handle_followup_websocket(
             await save_session(session_id, session)
             return True
 
+        async def advance_after_answer(current_count: int) -> bool:
+            """After question `current_count` has been answered, offer the
+            midpoint card if this was question #6 and it hasn't been shown
+            yet, then generate + send the next question. Returns False if the
+            connection should stop (closed, disconnected, or errored).
+
+            Shared by the normal per-turn loop AND the reconnect path below —
+            a client that disconnects while the midpoint card was pending must
+            be re-offered that same card on reconnect, not have the
+            already-answered question #6 replayed at it.
+            """
+            if current_count >= MAX_FOLLOWUP_QUESTIONS:
+                await websocket.send_json({
+                    "message": "Maximum questions reached, generating diagnosis",
+                    "status": "ready_for_diagnosis",
+                })
+                await websocket.close(code=1000, reason="Max questions reached")
+                return False
+
+            if current_count == MIDPOINT_CARD_AFTER_QUESTION and not session.get("midpoint_card_shown"):
+                if not await offer_midpoint_card():
+                    return False
+                # Re-read: if the card was shown it took slot #7, so the next MCQ is #8.
+                current_count = session.get("question_count", current_count)
+
+            try:
+                next_raw = await run_blocking(get_next_followup_question, patient_state, 1)
+            except Exception as exc:
+                logger.exception("get_next_followup_question error session=%s: %s", session_id, exc)
+                await websocket.send_json({"error": "Failed to process answer (server error)."})
+                await websocket.close(code=1011, reason="Internal processing error")
+                return False
+
+            if isinstance(next_raw, dict) and next_raw.get("error") == "api_key_failure":
+                await websocket.send_json({"error": next_raw.get("message", "Service temporarily unavailable.")})
+                await websocket.close(code=1011, reason="API key failure")
+                return False
+
+            return await send_question(next_raw, current_count + 1)
+
         if session.get("question_count", 0) == 0:
             try:
                 raw_response = await run_blocking(get_next_followup_question, patient_state, 1)
@@ -217,6 +257,17 @@ async def handle_followup_websocket(
 
             continued = await send_question(raw_response, 1)
             if not continued:
+                return
+        elif (
+            session.get("question_count", 0) == MIDPOINT_CARD_AFTER_QUESTION
+            and not session.get("midpoint_card_shown")
+        ):
+            # Reconnecting after a disconnect that happened while the midpoint
+            # card was pending (its reply was never received, so question_count
+            # never advanced past #6). Re-offer the same card instead of
+            # resending last_options, which is still question #6 — already
+            # answered — and would otherwise be replayed at the patient.
+            if not await advance_after_answer(session.get("question_count", 0)):
                 return
         else:
             last_q = session.get("last_options")
@@ -270,35 +321,7 @@ async def handle_followup_websocket(
                 logger.warning("update_state_with_answer failed session=%s: %s", session_id, exc)
 
             current_count = session.get("question_count", 0)
-            if current_count >= MAX_FOLLOWUP_QUESTIONS:
-                await websocket.send_json({
-                    "message": "Maximum questions reached, generating diagnosis",
-                    "status": "ready_for_diagnosis",
-                })
-                await websocket.close(code=1000, reason="Max questions reached")
-                break
-
-            if current_count == MIDPOINT_CARD_AFTER_QUESTION and not session.get("midpoint_card_shown"):
-                if not await offer_midpoint_card():
-                    break
-                # Re-read: if the card was shown it took slot #7, so the next MCQ is #8.
-                current_count = session.get("question_count", current_count)
-
-            try:
-                next_raw = await run_blocking(get_next_followup_question, patient_state, 1)
-            except Exception as exc:
-                logger.exception("get_next_followup_question error session=%s: %s", session_id, exc)
-                await websocket.send_json({"error": "Failed to process answer (server error)."})
-                await websocket.close(code=1011, reason="Internal processing error")
-                break
-
-            if isinstance(next_raw, dict) and next_raw.get("error") == "api_key_failure":
-                await websocket.send_json({"error": next_raw.get("message", "Service temporarily unavailable.")})
-                await websocket.close(code=1011, reason="API key failure")
-                break
-
-            continued = await send_question(next_raw, current_count + 1)
-            if not continued:
+            if not await advance_after_answer(current_count):
                 break
 
     except WebSocketDisconnect:

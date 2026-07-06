@@ -3,10 +3,18 @@
 JACCARD_REPEAT_THRESHOLD = 0.72
 OPTION_OVERLAP_THRESHOLD = 0.75
 
-# The flow is 8-12 diagnostic "questions": MCQs 1-6, the midpoint symptom card
-# as #7, then MCQs 8-12. Early stop is allowed only from question MIN onward,
-# and only when the diagnosis is high-confidence — so every session asks at
-# least 8 questions and never more than 12.
+# The flow is 8-12 diagnostic "questions" (MCQs 1-6, midpoint symptom card as
+# #7, MCQs 8-12). Early stop is allowed ONLY inside the 8-12 window:
+#   - turn <  EARLY_STOP_MIN_QUESTIONS (8): never stop, regardless of
+#     confidence — every session gathers at least 8 answers.
+#   - turn >= EARLY_STOP_MIN_QUESTIONS: stop when the LLM signals ready
+#     (can_stop_early), or autonomously when the tracked state is conclusive
+#     (confidence_score >= EARLY_STOP_CONFIDENCE, top differential High,
+#     runner-up Low — see followup.selection.should_stop_now), instead of
+#     asking filler questions to reach 12.
+#   - turn >= MAX: hard stop.
+EARLY_STOP_MIN_QUESTIONS = 8
+EARLY_STOP_CONFIDENCE = 0.85
 MIN_FOLLOWUP_QUESTIONS = 8
 MAX_FOLLOWUP_QUESTIONS = 12
 

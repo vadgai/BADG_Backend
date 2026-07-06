@@ -16,12 +16,11 @@ def check(name, ok, detail=""):
         FAILURES.append(name)
 
 
-def phase1_module_and_strategist():
-    print("\n=== Phase 1: Module + Strategist + feature_ids_asked ===")
+def phase1_module_and_feature_tracking():
+    print("\n=== Phase 1: Module + feature_ids_asked ===")
     required = [
         "followup/constants.py",
         "followup/feature_tracking.py",
-        "followup/agents/strategist.py",
         "followup/orchestrator.py",
     ]
     for rel in required:
@@ -29,7 +28,6 @@ def phase1_module_and_strategist():
 
     from followup.constants import JACCARD_REPEAT_THRESHOLD, MAX_FOLLOWUP_QUESTIONS, MIN_FOLLOWUP_QUESTIONS
     from followup.feature_tracking import record_sent_question, is_feature_already_asked
-    from followup.agents.strategist import plan_next_question, build_strategy_context
 
     check("constants loaded", MIN_FOLLOWUP_QUESTIONS == 4 and MAX_FOLLOWUP_QUESTIONS == 10)
     check("Jaccard threshold", JACCARD_REPEAT_THRESHOLD == 0.72)
@@ -38,18 +36,6 @@ def phase1_module_and_strategist():
     record_sent_question(ss, {"Question": "Q1", "feature_id": "fever_pattern", "A": "a", "B": "b", "C": "c", "D": "d"})
     check("feature_ids_asked tracked", is_feature_already_asked(ss, "fever_pattern"))
     check("questions_asked tracked", "Q1" in ss.get("questions_asked", []))
-
-    from diagnosis_methods.patient_state import initialize_patient_state
-
-    state = initialize_patient_state(30, "Male", ["fever", "headache", "chills"])
-    state["symptom_state"] = {"questions_asked": [], "feature_ids_asked": [], "current_symptoms": ["fever", "headache"]}
-    result = plan_next_question(state)
-    check(
-        "strategist callable",
-        result is None or isinstance(result, (dict, str)),
-        f"type={type(result).__name__}",
-    )
-    _ = build_strategy_context(state)
 
 
 def phase2_critic_and_validators():
@@ -174,7 +160,7 @@ def syntax_all_followup_py():
 
 def main():
     print("VADG Follow-up Phase Verification")
-    phase1_module_and_strategist()
+    phase1_module_and_feature_tracking()
     phase2_critic_and_validators()
     phase3_app_split_and_fallbacks()
     phase4_orchestrator_and_legacy()

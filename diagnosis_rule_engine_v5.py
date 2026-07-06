@@ -1,19 +1,17 @@
 """
-Diagnosis Rule Engine v5
-Final weighing: combines rule-based matching with LLM refinement.
+Diagnosis Rule Engine v5 — final diagnosis weighing.
+
+Fully LLM-driven: no disease-registry scoring, no Bayesian posterior. The
+patient's own accumulated differential (tracked turn-by-turn through the
+follow-up loop by diagnosis_methods.state_followup.analyze_answer_for_state)
+is the primary input; this module makes one finalizing LLM call over the full
+evidence trail and returns the top-3 conditions with clinician-style reasoning.
 """
 
 import json
 import logging
-import os
-import re
 from typing import Any, Dict, List, Optional
 
-from diagnosis_rule_engine import (
-    load_diseases_from_folder,
-    build_disease_profiles,
-    analyze_case,
-)
 from utils.gemini_api_manager import (
     generate_content_with_fallback,
     extract_json_from_text,
@@ -21,290 +19,6 @@ from utils.gemini_api_manager import (
 )
 
 logger = logging.getLogger(__name__)
-
-_PROFILES_READY = False
-_DIAG_V6_SCORER = str(os.getenv("DIAG_V6_SCORER", "true")).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _ensure_profiles_loaded() -> None:
-    global _PROFILES_READY
-    if _PROFILES_READY:
-        return
-    load_diseases_from_folder()
-    build_disease_profiles()
-    _PROFILES_READY = True
-
-
-def _anchor_topk_to_posterior(
-    result: Dict[str, Any],
-    belief: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Force the report's top-2 to respect the belief-state posterior.
-
-    The LLM re-ranker refines wording/specificity and #3, but it must not
-    reorder the top-2 or float a low-posterior / out-of-pool disease into #2.
-    The belief posterior already weighs every positive, negative, duration and
-    demographic prior, so it is authoritative for ordering. We keep the LLM's
-    name, reasoning and urgency but:
-      - sort in-pool conditions (those matching a posterior entry) by posterior,
-      - push out-of-pool conditions below them (they can never be #1/#2 when
-        >=2 in-pool conditions exist),
-      - re-band probability from posterior (High>=0.5 / Moderate>=0.25 / Low)
-        with a monotonic ceiling so confidence matches rank.
-    """
-    if not isinstance(result, dict) or not isinstance(belief, dict):
-        return result
-    posterior = belief.get("posterior") if isinstance(belief.get("posterior"), dict) else {}
-    conds = result.get("conditions")
-    if not posterior or not isinstance(conds, list) or len(conds) < 2:
-        return result
-
-    try:
-        from followup.information_gain import _core_names_related
-    except Exception:
-        return result
-
-    post_items = list(posterior.items())
-
-    def _posterior_for(name: str) -> float:
-        n = str(name or "").strip().lower()
-        if not n:
-            return -1.0
-        best = -1.0
-        for pname, pval in post_items:
-            if n == str(pname).strip().lower() or _core_names_related(n, str(pname)):
-                try:
-                    best = max(best, float(pval))
-                except (TypeError, ValueError):
-                    continue
-        return best
-
-    annotated = [(_posterior_for(c.get("name", "")), i, c) for i, c in enumerate(conds)]
-    in_pool = sorted((a for a in annotated if a[0] >= 0.0), key=lambda a: (-a[0], a[1]))
-    out_pool = [a for a in annotated if a[0] < 0.0]
-    ordered = [a for a in in_pool] + [a for a in out_pool]
-
-    band_name = {2: "High", 1: "Moderate", 0: "Low"}
-    band_level = {"high": 2, "moderate": 1, "low": 0}
-    ceiling = 2
-    reordered: List[Dict[str, Any]] = []
-    for post, _idx, cond in ordered[:3]:
-        cond = dict(cond)
-        if post >= 0.0:  # in-pool → band by posterior, monotonic down the list
-            raw = 2 if post >= 0.50 else 1 if post >= 0.25 else 0
-            cond["posterior"] = round(post, 3)
-        else:  # out-of-pool #3 → keep the LLM band but cap it monotonically
-            raw = band_level.get(str(cond.get("probability", "Low")).strip().lower(), 0)
-        raw = min(raw, ceiling)
-        ceiling = raw
-        cond["probability"] = band_name[raw]
-        reordered.append(cond)
-
-    result = dict(result)
-    result["conditions"] = reordered
-    return result
-
-
-def _format_chat_history(chat_history) -> str:
-    if not chat_history:
-        return "No previous questions asked."
-
-    if isinstance(chat_history, str):
-        try:
-            parsed = json.loads(chat_history)
-            chat_history = parsed
-        except Exception:
-            return chat_history.strip() or "No previous questions asked."
-
-    if isinstance(chat_history, list):
-        lines: List[str] = []
-        q_idx = 0
-        for i, msg in enumerate(chat_history):
-            if not isinstance(msg, dict):
-                continue
-            bot_text = msg.get("bot") or msg.get("Question")
-            if bot_text:
-                q_idx += 1
-                lines.append(f"Q{q_idx}: {str(bot_text).strip()}")
-                if i + 1 < len(chat_history):
-                    next_msg = chat_history[i + 1]
-                    if isinstance(next_msg, dict) and next_msg.get("user"):
-                        lines.append(f"A{q_idx}: {str(next_msg.get('user')).strip()}")
-        return "\n".join(lines) if lines else "No previous questions asked."
-
-    return str(chat_history).strip() or "No previous questions asked."
-
-
-def _normalize_conditions(
-    data: Dict[str, Any],
-    fallback: Dict[str, Any],
-    candidate_pool: Optional[List[Dict[str, Any]]] = None,
-    positives: Optional[List[str]] = None,
-    negatives: Optional[List[str]] = None,
-) -> Dict[str, Any]:
-    if not isinstance(data, dict):
-        return fallback
-
-    raw_conditions = data.get("conditions")
-    if not isinstance(raw_conditions, list) or not raw_conditions:
-        return fallback
-
-    candidate_pool = candidate_pool or []
-    candidate_by_name = {
-        str(item.get("name", "")).strip().lower(): item
-        for item in candidate_pool
-        if isinstance(item, dict) and str(item.get("name", "")).strip()
-    }
-    positives = positives or []
-    negatives = negatives or []
-
-    normalized: List[Dict[str, Any]] = []
-    for cond in raw_conditions:
-        if not isinstance(cond, dict):
-            continue
-        name = str(cond.get("name", "")).strip()
-        if not name:
-            continue
-        probability = str(cond.get("probability", "Low")).strip() or "Low"
-        reasoning = str(cond.get("reasoning", "")).strip() or "Based on reported symptoms and history."
-        urgency = str(cond.get("urgency", "Routine")).strip() or "Routine"
-        candidate_entry = candidate_by_name.get(name.lower())
-        is_supported = _condition_supported_by_evidence(
-            {"name": name, "reasoning": reasoning},
-            positives=positives,
-            negatives=negatives,
-            candidate_by_name=candidate_by_name,
-        )
-        if not is_supported:
-            continue
-        normalized.append(
-            {
-                "name": name,
-                "probability": probability,
-                "reasoning": reasoning,
-                "urgency": urgency,
-                "score": candidate_entry.get("score") if isinstance(candidate_entry, dict) else None,
-                "score_details": candidate_entry.get("score_details") if isinstance(candidate_entry, dict) else {},
-            }
-        )
-        if len(normalized) >= 3:
-            break
-
-    if not normalized:
-        return fallback
-
-    result: Dict[str, Any] = {"conditions": normalized}
-    if "diagnosis_summary" in data:
-        result["diagnosis_summary"] = str(data.get("diagnosis_summary", "")).strip()
-    if "accuracy_warning" in data:
-        result["accuracy_warning"] = str(data.get("accuracy_warning", "")).strip()
-    if "follow_up_questions" in data and isinstance(data.get("follow_up_questions"), list):
-        result["follow_up_questions"] = data.get("follow_up_questions")
-    return result
-
-
-def _fallback_from_rule(rule_result: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(rule_result, dict):
-        return {"conditions": []}
-
-    conditions = rule_result.get("conditions")
-    if not isinstance(conditions, list):
-        return {"conditions": []}
-
-    normalized: List[Dict[str, Any]] = []
-    for cond in conditions:
-        if not isinstance(cond, dict):
-            continue
-        name = str(cond.get("name", "")).strip()
-        if not name:
-            continue
-        normalized.append(
-            {
-                "name": name,
-                "probability": str(cond.get("probability", "Low")).strip() or "Low",
-                "reasoning": str(cond.get("reasoning", "")).strip() or "Based on reported symptoms.",
-                "urgency": str(cond.get("urgency", "Routine")).strip() or "Routine",
-                "score": cond.get("score"),
-                "score_details": cond.get("score_details") if isinstance(cond.get("score_details"), dict) else {},
-            }
-        )
-        if len(normalized) >= 3:
-            break
-
-    return {"conditions": normalized}
-
-
-def _normalize_term_set(items: List[str]) -> set:
-    values = set()
-    for item in items:
-        text = re.sub(r"\s+", " ", str(item or "").strip().lower())
-        if text:
-            values.add(text)
-    return values
-
-
-def _extract_candidate_pool(rule_result: Dict[str, Any], limit: int = 6) -> List[Dict[str, Any]]:
-    if not isinstance(rule_result, dict):
-        return []
-    candidates = rule_result.get("conditions")
-    if not isinstance(candidates, list):
-        return []
-    out: List[Dict[str, Any]] = []
-    for condition in candidates:
-        if not isinstance(condition, dict):
-            continue
-        name = str(condition.get("name", "")).strip()
-        if not name:
-            continue
-        out.append(
-            {
-                "name": name,
-                "probability": str(condition.get("probability", "Low")).strip() or "Low",
-                "score": condition.get("score"),
-                "score_details": condition.get("score_details") if isinstance(condition.get("score_details"), dict) else {},
-                "reasoning": str(condition.get("reasoning", "")).strip(),
-                "urgency": str(condition.get("urgency", "Routine")).strip() or "Routine",
-            }
-        )
-        if len(out) >= limit:
-            break
-    return out
-
-
-def _condition_supported_by_evidence(
-    condition: Dict[str, Any],
-    positives: List[str],
-    negatives: List[str],
-    candidate_by_name: Dict[str, Dict[str, Any]],
-) -> bool:
-    name = str(condition.get("name", "")).strip()
-    if not name:
-        return False
-    in_pool = name.lower() in candidate_by_name
-    reasoning = str(condition.get("reasoning", "")).strip().lower()
-    positive_terms = _normalize_term_set(positives)
-    negative_terms = _normalize_term_set(negatives)
-    detail = candidate_by_name.get(name.lower(), {})
-    score_details = detail.get("score_details") if isinstance(detail.get("score_details"), dict) else {}
-    contrad = set(str(x).strip().lower() for x in score_details.get("contradicted_features", []))
-    exclude_hits = set(str(x).strip().lower() for x in score_details.get("exclude_hits", []))
-
-    if in_pool and not exclude_hits:
-        return True
-    if in_pool and exclude_hits and positive_terms.intersection(exclude_hits):
-        return False
-
-    # Out-of-pool suggestion can pass only if reasoning references concrete positives and avoids negatives.
-    if not in_pool:
-        if not any(term in reasoning for term in positive_terms):
-            return False
-        if any(term in reasoning for term in negative_terms):
-            return False
-        return True
-
-    if contrad and positive_terms.intersection(contrad):
-        return False
-    return True
 
 
 def _format_chat_history_brief(chat_history) -> str:
@@ -324,35 +38,118 @@ def _format_chat_history_brief(chat_history) -> str:
     return "\n".join(lines) if lines else "No Q&A history."
 
 
+def _existing_differential(patient_state: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The differential the LLM has already been maintaining turn-by-turn."""
+    if not isinstance(patient_state, dict):
+        return []
+    differential = patient_state.get("differential_diagnosis")
+    if not isinstance(differential, list):
+        return []
+    out = []
+    for item in differential:
+        if isinstance(item, dict) and str(item.get("name", "")).strip():
+            out.append(item)
+    return out
+
+
+def _fallback_from_differential(differential: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Used only if the finalizing LLM call itself fails — never an empty result
+    when the follow-up loop already built a working differential."""
+    normalized = []
+    for item in differential[:3]:
+        normalized.append(
+            {
+                "name": str(item.get("name", "")).strip(),
+                "probability": str(item.get("confidence") or item.get("probability") or "Low").strip(),
+                "reasoning": str(item.get("reasoning", "")).strip() or "Based on reported symptoms and history.",
+                "urgency": str(item.get("urgency", "Routine")).strip() or "Routine",
+            }
+        )
+    return {"conditions": normalized}
+
+
+def _normalize_term_set(items: List[str]) -> set:
+    values = set()
+    for item in items:
+        text = str(item or "").strip().lower()
+        if text:
+            values.add(text)
+    return values
+
+
+# Cues that mean a mentioned finding is being cited as RULED OUT, not claimed
+# as present. Standard clinical reasoning routinely explains why competing
+# diagnoses are less likely by naming the very findings the patient denied
+# ("absence of vomiting", "patient denied a missed period") — that is correct,
+# expected reasoning, not a hallucination, and must not be penalized.
+_NEGATION_CUES = (
+    "no ", "not ", "denies", "denied", "denying", "denial", "absence of",
+    "absent", "without", "lack of", "lacks", "lacking", "ruled out",
+    "rules out", "negative for", "no evidence of", "doesn't have",
+    "does not have", "didn't have", "did not have", "excludes", "excluded",
+    "unlikely given", "reports no", "free of", "no history of",
+)
+
+
+def _term_asserted_as_present(term: str, reasoning: str) -> bool:
+    """True only if `term` appears in the reasoning WITHOUT a negation cue
+    earlier in the same clause — i.e. the model is treating a denied finding
+    as if it were present/supportive (a real hallucination), not correctly
+    citing its absence to rule an alternative out. The window is wide enough
+    to cover "denied X, Y, or Z" style comma-lists after a single cue, but
+    stops at the start of the current clause (a preceding '.' or ';') so a
+    cue from an unrelated, earlier sentence can't suppress a real hit."""
+    idx = reasoning.find(term)
+    if idx == -1:
+        return False
+    window = reasoning[max(0, idx - 100):idx]
+    clause_start = max(window.rfind("."), window.rfind(";"))
+    if clause_start != -1:
+        window = window[clause_start + 1:]
+    return not any(cue in window for cue in _NEGATION_CUES)
+
+
+def _condition_supported_by_evidence(
+    condition: Dict[str, Any],
+    positives_text: set,
+    negatives_text: set,
+) -> bool:
+    """Anti-hallucination guard: the LLM's stated reasoning must reference the
+    patient's actual confirmed findings and must not claim a denied finding is
+    present/supportive. There's no registry pool to check membership against
+    anymore, so this is the sole safety net against an ungrounded diagnosis."""
+    reasoning = str(condition.get("reasoning", "")).strip().lower()
+    if not reasoning:
+        return False
+    if positives_text and not any(term in reasoning for term in positives_text):
+        # No positives at all is unusual but not necessarily wrong (e.g. a
+        # purely demographic/red-flag-driven consideration) — only reject when
+        # we DO have positives and the reasoning cites none of them.
+        return False
+    if any(_term_asserted_as_present(term, reasoning) for term in negatives_text):
+        return False
+    return True
+
+
 def _build_prompt(
     age: Any,
     gender: Any,
     positives: List[str],
     negatives: List[str],
     chat_history,
-    rule_context: Dict[str, Any],
-    candidate_pool: List[Dict[str, Any]],
+    differential: List[Dict[str, Any]],
     patient_state: Optional[Dict[str, Any]] = None,
 ) -> str:
-    # Fix H: format chat_history instead of discarding it
     chat_history_text = _format_chat_history_brief(chat_history)
     positives_str = ", ".join(positives) if positives else "None reported"
     negatives_str = ", ".join(negatives) if negatives else "None reported"
 
-    rule_lines = []
-    for idx, cond in enumerate(rule_context.get("conditions", [])[:3], 1):
-        name = cond.get("name", "Unknown")
-        prob = cond.get("probability", "Unknown")
-        rule_lines.append(f"{idx}. {name} ({prob})")
-    rule_context_text = "\n".join(rule_lines) if rule_lines else "None"
-
-    state_summary = ""
     state_modifiers = "None"
     state_red_flags = "None"
     asked_count = 0
+    running_summary_line = ""
     if isinstance(patient_state, dict):
         running_summary = patient_state.get("running_summary")
-        differential = patient_state.get("differential_diagnosis")
         symptom_state = patient_state.get("symptom_state") if isinstance(patient_state.get("symptom_state"), dict) else {}
         modifier_map = symptom_state.get("modifier_map") if isinstance(symptom_state.get("modifier_map"), dict) else {}
         modifiers = symptom_state.get("modifiers") if isinstance(symptom_state.get("modifiers"), list) else []
@@ -365,63 +162,40 @@ def _build_prompt(
             state_modifiers = ", ".join(str(m).strip() for m in modifiers if str(m).strip()) or "None"
         state_red_flags = ", ".join(str(r).strip() for r in red_flags if str(r).strip()) or "None"
         asked_count = len(asked)
-        if running_summary:
-            state_summary += f"\nRunning summary: {running_summary}"
-        if isinstance(differential, list) and differential:
-            ddx_lines = []
-            for idx, item in enumerate(differential[:3], 1):
-                name = item.get("name", "Unknown")
-                confidence = item.get("confidence", "Unknown")
-                ddx_lines.append(f"{idx}. {name} ({confidence})")
-            state_summary += "\nRecent differential: " + "; ".join(ddx_lines)
+        if running_summary and str(running_summary).strip():
+            running_summary_line = f"\nRunning clinical summary (built during the interview): {str(running_summary).strip()}"
 
-    # Fix J: build a human-readable evidence trace for each candidate
-    candidate_lines = []
-    for idx, cand in enumerate(candidate_pool[:6], 1):
-        name = cand.get("name", "Unknown")
-        prob = cand.get("probability", "?")
-        score_details = cand.get("score_details") if isinstance(cand.get("score_details"), dict) else {}
-        matched = score_details.get("matched_positive_features", [])[:5]
-        contradicted = score_details.get("contradicted_features", [])[:3]
-        excluded = score_details.get("exclude_hits", [])[:2]
-        reasoning = str(cand.get("reasoning", "")).strip()[:100]
-        evidence_line = f"{idx}. {name} ({prob})"
-        if matched:
-            evidence_line += f"\n   + Evidence: {', '.join(matched)}"
-        if contradicted:
-            evidence_line += f"\n   - Contradicted by: {', '.join(contradicted)}"
-        if excluded:
-            evidence_line += f"\n   ! Exclude-hit conflict: {', '.join(excluded)}"
-        if reasoning:
-            evidence_line += f"\n   Reasoning: {reasoning}"
-        candidate_lines.append(evidence_line)
-    candidate_context_text = "\n".join(candidate_lines) if candidate_lines else "None"
+    diff_lines = []
+    for idx, item in enumerate(differential[:3], 1):
+        name = item.get("name", "Unknown")
+        confidence = item.get("confidence") or item.get("probability") or "Unknown"
+        reasoning = str(item.get("reasoning", "")).strip()
+        diff_lines.append(f"{idx}. {name} ({confidence}) — {reasoning[:150]}")
+    diff_text = "\n".join(diff_lines) if diff_lines else "No working differential yet — build one from the evidence below."
 
-    return f"""Expert clinical diagnostician doing final diagnostic weighing. The deterministic ranking is primary truth; reorder only when evidence clearly supports it. Output JSON only.
+    return f"""Expert clinical diagnostician doing the FINAL diagnostic weighing at the end of a patient interview. You have been reasoning about this case turn-by-turn already; this is your final, most careful pass over the full evidence. Output JSON only.
 
 Patient: {age}/{gender}
-+Findings: {positives_str}
--Findings: {negatives_str}
++Findings (confirmed): {positives_str}
+-Findings (denied): {negatives_str}
 Modifiers: {state_modifiers}
 Red flags: {state_red_flags}
-Questions asked: {asked_count}
+Questions asked: {asked_count}{running_summary_line}
 
 Q&A history:
 {chat_history_text}
 
-Rule-based matches:
-{rule_context_text}
-{state_summary}
-
-Candidate pool with evidence trace:
-{candidate_context_text}
+Your working differential from the interview so far:
+{diff_text}
 
 TASK:
-1) Rank the TOP 3 conditions, reordering only within the candidate pool.
-2) Allow an out-of-pool condition ONLY if explicitly supported by positives/modifiers/red flags and not contradicted by negatives.
-3) Per condition: probability (High/Moderate/Low), 1-2 sentence reasoning anchored to (+)/(-)/modifiers/red flags and consistent with the probability, urgency (Emergency/Routine/Monitor).
-4) Use the Q&A history for refinement (exact wording, negatives, progression).
-5) Name the MOST SPECIFIC diagnosis the evidence supports, never a broad category (e.g. "Pulmonary tuberculosis" not "Respiratory infection"; "Acute appendicitis" not "Abdominal pathology").
+1) Rank the TOP 3 conditions using standard clinical reasoning — you are not constrained to any predefined list, use your own medical knowledge. You may keep, reorder, or replace entries from your working differential above if the full evidence now supports something more specific or more likely.
+2) Every condition's reasoning MUST explicitly reference the patient's actual confirmed (+) findings and MUST NOT be contradicted by a denied (-) finding — never invent a symptom not listed above.
+3) Per condition: probability using this exact rubric — High (you'd estimate >=70% likely given this evidence), Moderate (50-70%), Low (<50%) — 1-2 sentence reasoning anchored to (+)/(-)/modifiers/red flags, urgency (Emergency/Routine/Monitor).
+4) Use the Q&A history for refinement (exact wording, negatives, progression, chronicity — a chronic multi-week course with weight loss/night sweats argues against acute conditions).
+4b) WEIGHT BY SPECIFICITY: a hallmark/near-specific finding (pain behind the eyes → dengue over chikungunya; right-shoulder radiation + fatty-food trigger → gallbladder; fixed-station morning cough in a smoker → COPD) outweighs a nonspecific symptom the top candidates share (fever, body ache, joint pain). Do not let a single shared symptom decide #1. Do NOT assign a chronic/inflammatory label (e.g. "chronic cholecystitis", "chronic pancreatitis") unless an inflammatory sign is present (fever, tenderness, raised markers) — recurrent episodes without inflammation stay the simpler diagnosis (e.g. biliary colic / symptomatic gallstones).
+5) Name the MOST SPECIFIC diagnosis the evidence supports, never a broad category (e.g. "Pulmonary tuberculosis" not "Respiratory infection"; "Acute appendicitis" not "Abdominal pathology"; "Generalized Anxiety Disorder" not "Stress").
+6) If red flags are present, urgency must be Emergency and this must be reflected in probability/ordering.
 
 Return JSON only:
 {{
@@ -430,11 +204,60 @@ Return JSON only:
     {{"name": "...", "probability": "High|Moderate|Low", "reasoning": "...", "urgency": "Emergency|Routine|Monitor"}},
     {{"name": "...", "probability": "High|Moderate|Low", "reasoning": "...", "urgency": "Emergency|Routine|Monitor"}},
     {{"name": "...", "probability": "High|Moderate|Low", "reasoning": "...", "urgency": "Emergency|Routine|Monitor"}}
-  ],
-  "follow_up_questions": [],
-  "override": {{"used": false, "condition": "", "reason": ""}}
+  ]
 }}
 """
+
+
+def _normalize_conditions(
+    data: Dict[str, Any],
+    fallback: Dict[str, Any],
+    positives: List[str],
+    negatives: List[str],
+) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        return fallback
+
+    raw_conditions = data.get("conditions")
+    if not isinstance(raw_conditions, list) or not raw_conditions:
+        return fallback
+
+    positive_terms = _normalize_term_set(positives)
+    negative_terms = _normalize_term_set(negatives)
+
+    normalized: List[Dict[str, Any]] = []
+    seen_names = set()
+    for cond in raw_conditions:
+        if not isinstance(cond, dict):
+            continue
+        name = str(cond.get("name", "")).strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen_names:
+            continue
+        if not _condition_supported_by_evidence(cond, positive_terms, negative_terms):
+            logger.info("get_final_diagnosis_v5: rejected ungrounded suggestion %r", name)
+            continue
+        seen_names.add(key)
+        normalized.append(
+            {
+                "name": name,
+                "probability": str(cond.get("probability", "Low")).strip() or "Low",
+                "reasoning": str(cond.get("reasoning", "")).strip() or "Based on reported symptoms and history.",
+                "urgency": str(cond.get("urgency", "Routine")).strip() or "Routine",
+            }
+        )
+        if len(normalized) >= 3:
+            break
+
+    if not normalized:
+        return fallback
+
+    result: Dict[str, Any] = {"conditions": normalized}
+    if "diagnosis_summary" in data:
+        result["diagnosis_summary"] = str(data.get("diagnosis_summary", "")).strip()
+    return result
 
 
 def get_final_diagnosis_v5(
@@ -452,11 +275,16 @@ def get_final_diagnosis_v5(
     patient_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Final weighing pipeline:
-    - Rule-based scoring from disease registry
-    - LLM refinement using structured symptom state (+/- findings and red flags)
+    Final weighing pipeline — fully LLM-driven, no disease-registry scoring.
+
+    The follow-up loop already builds and refines a differential turn-by-turn
+    (patient_state["differential_diagnosis"], maintained by
+    diagnosis_methods.state_followup.analyze_answer_for_state). This makes one
+    last, most-careful LLM pass over the complete evidence trail to produce the
+    final top-3, anchored only to the patient's own confirmed/denied findings —
+    never to a hardcoded disease dataset.
     """
-    _ensure_profiles_loaded()
+    del weight, height, occupation, location, physical_activity, diet_type  # unused here; kept for call-site compatibility
 
     positives: List[str] = []
     if isinstance(symptoms, list):
@@ -466,42 +294,8 @@ def get_final_diagnosis_v5(
 
     negatives_list = negatives if isinstance(negatives, list) else []
 
-    symptom_state = patient_state.get("symptom_state") if isinstance(patient_state, dict) and isinstance(patient_state.get("symptom_state"), dict) else {}
-    red_flags = symptom_state.get("red_flags") if isinstance(symptom_state.get("red_flags"), list) else []
-    modifiers = symptom_state.get("modifier_map") if isinstance(symptom_state.get("modifier_map"), dict) else symptom_state.get("modifiers")
-
-    rule_result = analyze_case(
-        age=age,
-        gender=gender,
-        symptoms=positives,
-        chat_history="No raw chat history used. Structured state only.",
-        weight=weight,
-        height=height,
-        negatives=negatives_list,
-        modifiers=modifiers,
-        red_flags=red_flags if isinstance(red_flags, list) else [],
-    )
-
-    # Primary ranking = the belief-state posterior (the SAME distribution that drove
-    # the follow-up questions, and which factors in duration/lifestyle/history), so
-    # the final report is consistent with the loop. Falls back to the raw rule
-    # ranking if the belief state can't be built (e.g. no structured positives).
-    belief = None
-    if isinstance(patient_state, dict):
-        try:
-            from followup.information_gain import rank_final_diagnoses
-            belief = rank_final_diagnoses(patient_state, limit=3)
-        except Exception as exc:
-            logger.warning("get_final_diagnosis_v5: belief ranking failed: %s", exc)
-    if belief and belief.get("conditions"):
-        fallback = {"conditions": belief["conditions"]}
-        candidate_pool = _extract_candidate_pool(fallback)
-    else:
-        fallback = _fallback_from_rule(rule_result)
-        candidate_pool = _extract_candidate_pool(rule_result)
-
-    if not _DIAG_V6_SCORER:
-        return fallback
+    differential = _existing_differential(patient_state)
+    fallback = _fallback_from_differential(differential) if differential else {"conditions": []}
 
     model_ok, _ = get_gemini_model()
     if not model_ok:
@@ -513,8 +307,7 @@ def get_final_diagnosis_v5(
         positives=positives,
         negatives=negatives_list,
         chat_history=chat_history,
-        rule_context=fallback,
-        candidate_pool=candidate_pool,
+        differential=differential,
         patient_state=patient_state,
     )
 
@@ -533,29 +326,12 @@ def get_final_diagnosis_v5(
         normalized = _normalize_conditions(
             parsed,
             fallback,
-            candidate_pool=candidate_pool,
             positives=positives,
             negatives=negatives_list,
         )
         normalized_conditions = normalized.get("conditions") if isinstance(normalized, dict) else None
         if not isinstance(normalized_conditions, list) or not normalized_conditions:
             return fallback
-        candidate_names = {str(c.get("name", "")).strip().lower() for c in candidate_pool if isinstance(c, dict)}
-        normalized_names = {str(c.get("name", "")).strip().lower() for c in normalized_conditions if isinstance(c, dict)}
-        raw_names = set()
-        if isinstance(parsed, dict) and isinstance(parsed.get("conditions"), list):
-            for cond in parsed.get("conditions"):
-                if isinstance(cond, dict):
-                    nm = str(cond.get("name", "")).strip().lower()
-                    if nm:
-                        raw_names.add(nm)
-        rejected_out_of_pool = [nm for nm in raw_names if nm not in candidate_names and nm not in normalized_names]
-        if rejected_out_of_pool and isinstance(patient_state, dict):
-            counters = patient_state.setdefault("diagnostic_counters", {})
-            counters["out_of_pool_llm_suggestion_rejections"] = int(counters.get("out_of_pool_llm_suggestion_rejections", 0) or 0) + len(rejected_out_of_pool)
-        # Anchor the final top-2 to the belief posterior so the LLM cannot float a
-        # low-posterior / out-of-pool disease into the #2 slot.
-        normalized = _anchor_topk_to_posterior(normalized, belief)
         return normalized
     except Exception as exc:
         logger.warning("get_final_diagnosis_v5: error: %s", exc)

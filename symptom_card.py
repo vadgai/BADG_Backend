@@ -17,9 +17,9 @@ a final discriminating symptom set to confirm the narrowed picture before the
 final 2-diagnosis analysis.
 
 Selections merge into patient_state (selected -> positives, offered-but-unselected
--> negatives), so they flow into the existing rule-engine + report pipeline. Uses
-the information-gain ranker so each card offers the MOST discriminating symptoms,
-not arbitrary ones.
+-> negatives), so they flow into the follow-up + report pipeline. Uses a Gemini
+call (_llm_symptom_card) so each card offers the MOST discriminating symptoms
+given the patient's own evolving differential, not a registry lookup.
 """
 
 import logging
@@ -219,12 +219,92 @@ def _build_clinical_factors(organ_systems: List[str]) -> List[Dict[str, Any]]:
     ]
 
 
+def _llm_symptom_card(patient_state: Dict[str, Any], top_k: int, limit: int) -> Dict[str, Any]:
+    """LLM replacement for the old registry-backed information-gain ranker.
+
+    Returns the same shape the module below already consumes (top_conditions /
+    organ_systems / symptoms) so _clean_symptoms and _build_clinical_factors
+    need no change — just a different, fully LLM-driven source.
+    """
+    from utils.gemini_api_manager import (
+        generate_content_with_fallback,
+        extract_json_from_text,
+        get_gemini_model,
+    )
+
+    model_ok, _ = get_gemini_model()
+    if not model_ok:
+        return {}
+
+    demographics = patient_state.get("demographics") if isinstance(patient_state.get("demographics"), dict) else {}
+    age = demographics.get("age", "Unknown")
+    gender = demographics.get("gender", "Unknown")
+
+    symptom_state = patient_state.get("symptom_state") if isinstance(patient_state.get("symptom_state"), dict) else {}
+    positives = (
+        symptom_state.get("current_symptoms")
+        if isinstance(symptom_state.get("current_symptoms"), list)
+        else patient_state.get("identified_symptoms", [])
+    )
+    negatives = patient_state.get("negatives") if isinstance(patient_state.get("negatives"), list) else []
+    positives_text = ", ".join(str(s).strip() for s in positives if str(s).strip()) or "None reported"
+    negatives_text = ", ".join(str(s).strip() for s in negatives if str(s).strip()) or "None reported"
+
+    differential = (
+        patient_state.get("differential_diagnosis")
+        if isinstance(patient_state.get("differential_diagnosis"), list)
+        else []
+    )
+    diff_lines = []
+    for idx, item in enumerate(differential[:top_k], 1):
+        if isinstance(item, dict):
+            name = str(item.get("name", "")).strip()
+            confidence = str(item.get("confidence") or item.get("probability") or "").strip()
+            if name:
+                diff_lines.append(f"{idx}. {name} ({confidence})")
+    diff_text = "\n".join(diff_lines) if diff_lines else "Not yet established — infer from symptoms and demographics."
+
+    chief_complaint = str(patient_state.get("chief_complaint", "")).strip() or positives_text
+
+    prompt = f"""Clinical diagnostician building a patient-facing symptom checklist. JSON only.
+
+Patient: {age}/{gender} | Chief complaint: {chief_complaint}
++Confirmed: {positives_text}
+-Denied: {negatives_text}
+Working differential:
+{diff_text}
+
+TASK:
+1) top_conditions: the {top_k} most likely conditions given the evidence — use your own clinical knowledge, most specific name possible.
+2) organ_systems: 1-3 relevant organ systems from this exact set: respiratory, cardiovascular, gastrointestinal, hepatobiliary, renal, neurological, endocrine, infectious, musculoskeletal.
+3) symptoms: {limit} short, patient-reportable symptoms (2-4 words, plain everyday language, never a lab/exam/imaging finding) that the patient has NOT already confirmed or denied above. MAXIMIZE DISCRIMINATION: pick symptoms expected in ONE of the top conditions but absent in the others — if the patient ticks it, one diagnosis rises and another falls. NEVER include a symptom all top conditions share (it changes nothing), and include 1-2 red-flag symptoms that would upgrade urgency if present. Each with a short lowercase "dimension" tag (e.g. "chest_pain", "night_sweats", "bowel_habits").
+
+Return JSON only:
+{{"top_conditions": ["...", "..."], "organ_systems": ["..."], "symptoms": [{{"term": "...", "dimension": "..."}}]}}
+"""
+
+    try:
+        success, text, error = generate_content_with_fallback(
+            prompt=prompt,
+            max_retries=None,
+            temperature=0.3,
+            max_output_tokens=1000,
+        )
+        if not success or not text:
+            logger.warning("_llm_symptom_card: generation failed: %s", error)
+            return {}
+        parsed = extract_json_from_text(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception as exc:
+        logger.warning("_llm_symptom_card: error: %s", exc)
+        return {}
+
+
 def generate_symptom_card(patient_state: Dict[str, Any], stage: str = "initial") -> Dict[str, Any]:
     """Build a symptom-selection card for the given stage."""
     cfg = _STAGE_CONFIG.get(stage, _STAGE_CONFIG["initial"])
 
-    from followup.information_gain import rank_candidate_findings
-    ranked = rank_candidate_findings(patient_state, top_k=cfg["top_k"], limit=cfg["limit"] + 6)
+    ranked = _llm_symptom_card(patient_state, top_k=cfg["top_k"], limit=cfg["limit"] + 6)
 
     symptoms: List[Dict[str, str]] = []
     top_conditions: List[str] = []
@@ -232,7 +312,7 @@ def generate_symptom_card(patient_state: Dict[str, Any], stage: str = "initial")
     if ranked:
         top_conditions = ranked.get("top_conditions", [])[: cfg["top_k"]]
         organ_systems = ranked.get("organ_systems", [])
-        symptoms = _clean_symptoms(ranked.get("findings", []), cfg["limit"])
+        symptoms = _clean_symptoms(ranked.get("symptoms", []), cfg["limit"])
 
     clinical_factors = _build_clinical_factors(organ_systems) if cfg["with_factors"] else []
 
@@ -295,7 +375,7 @@ def apply_symptom_card(
     if not isinstance(patient_state, dict):
         return patient_state
 
-    from followup.information_gain import term_to_dimension
+    from followup.dimension_mapping import term_to_dimension
 
     offered = [str(o).strip() for o in (offered or []) if str(o).strip()]
     selected_set = {str(s).strip().lower() for s in (selected or []) if str(s).strip()}

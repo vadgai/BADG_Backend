@@ -87,6 +87,11 @@ ipython_config.py
 *.json
 positive-shell-475102-t5-3635a8666240.json
 service-account.json
+# Disease definitions are application data (read by diagnosis_rule_engine.py
+# at startup), not throwaway config — they were never committed because of
+# the blanket *.json rule above, so a fresh clone (or the deploy pipeline)
+# never had them in the first place. Track them.
+!diseases/*.json
 
 
 # pyenv

@@ -272,21 +272,18 @@ def generate_report_prompt(
     ruled_out = [str(n).strip() for n in ruled_out if str(n).strip()]
     red_flags = state.get("red_flags") if isinstance(state.get("red_flags"), list) else []
     red_flags = [str(r).strip() for r in red_flags if str(r).strip()]
-    deterministic_trace = []
+    reasoning_trace = []
     if isinstance(mapped_diseases, dict):
         conditions = mapped_diseases.get("conditions") if isinstance(mapped_diseases.get("conditions"), list) else []
         for cond in conditions[:3]:
             if not isinstance(cond, dict):
                 continue
-            score_details = cond.get("score_details") if isinstance(cond.get("score_details"), dict) else {}
-            deterministic_trace.append(
+            reasoning_trace.append(
                 {
                     "name": cond.get("name"),
                     "probability": cond.get("probability"),
-                    "score": cond.get("score"),
-                    "matched_positive_features": score_details.get("matched_positive_features", []),
-                    "contradicted_features": score_details.get("contradicted_features", []),
-                    "exclude_hits": score_details.get("exclude_hits", []),
+                    "reasoning": cond.get("reasoning"),
+                    "urgency": cond.get("urgency"),
                 }
             )
 
@@ -294,7 +291,7 @@ def generate_report_prompt(
     negatives_json = json.dumps(ruled_out, ensure_ascii=False)
     red_flags_json = json.dumps(red_flags, ensure_ascii=False)
     modifier_map_json = json.dumps(modifier_map, ensure_ascii=False)
-    deterministic_trace_json = json.dumps(deterministic_trace, ensure_ascii=False, default=str)
+    reasoning_trace_json = json.dumps(reasoning_trace, ensure_ascii=False, default=str)
     mapped_json = json.dumps(mapped_diseases, ensure_ascii=False, default=str)
     
     history_list = chat_history if isinstance(chat_history, list) else []
@@ -313,7 +310,7 @@ INPUT:
 - Ruled out: {negatives_json}
 - Red flags: {red_flags_json}
 - Modifier map: {modifier_map_json}
-- Deterministic score trace: {deterministic_trace_json}
+- Clinical reasoning trace: {reasoning_trace_json}
 - Mapped diseases: {mapped_json}{running_summary_text}
 
 Q&A HISTORY:
@@ -323,7 +320,7 @@ CONSTRAINTS:
 1. NO HALLUCINATION: list only symptoms in "Confirmed symptoms" or stated positively in the Q&A.
 2. CHRONICITY: judge from modifiers and Q&A.
 3. URGENCY: set "Emergency" if any red flag is present.
-4. TopDiseaseMatches MUST be a flat array of objects (no "Disease1"-style keys); keep it consistent with the deterministic trace/mapped diseases.
+4. TopDiseaseMatches MUST be a flat array of objects (no "Disease1"-style keys); keep it consistent with the clinical reasoning trace/mapped diseases.
 5. DEPTH: professional ClinicalSummary, RecommendedSpecialist, and RecommendedTests from the full presentation; no placeholders.
 6. If a Pre-validated Clinical Summary is given, use it as the ClinicalSummary foundation and do not contradict it.
 7. NextDiagnosticSteps: 3-5 bullets tied to the TOP predicted disease(s) in TopDiseaseMatches; name each test from RecommendedTests and explain why it helps confirm/rule out those specific conditions. No generic filler.

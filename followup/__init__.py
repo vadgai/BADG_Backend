@@ -2,10 +2,9 @@
 VADG follow-up module — multi-agent question flow.
 
 Agents:
-  1. Analyzer  — update_state_with_answer (orchestrator)
-  2. Strategist — plan_next_question (rules-first)
-  3. Writer    — build_followup_writer_prompt + LLM
-  4. Critic    — QuestionCritic gate before send
+  1. Analyzer — update_state_with_answer (orchestrator)
+  2. Writer   — build_followup_writer_prompt + LLM
+  3. Critic   — QuestionCritic gate before send
 """
 
 from followup.constants import MAX_FOLLOWUP_QUESTIONS, MIN_FOLLOWUP_QUESTIONS
