@@ -17,7 +17,13 @@ email-validator==2.1.0.post1
 python-dotenv==1.0.0
 
 # Google AI & Cloud Services
-google-generativeai==0.3.2
+# 0.3.2 predates GenerationConfig's response_mime_type field (used by
+# utils/gemini_api_manager.py for forced JSON output) — a container built from
+# that pin fails EVERY generation call in production with "ValueError: Unknown
+# field for GenerationConfig: response_mime_type" across all API keys, while
+# local dev (which has 0.8.5 already installed, ignoring this stale pin) works
+# fine. Pinned to the version already proven working in local dev.
+google-generativeai==0.8.5
 google-cloud-translate==3.15.1
 
 # MongoDB Database (Async)
@@ -39,12 +45,20 @@ bcrypt==4.0.1
 python-jose[cryptography]==3.3.0
 
 # AI & NLP Libraries
-langchain==0.1.4
-groq==0.4.2
+# NOTE (cost/image slimming, 2026-07-07): `langchain==0.1.4` and `groq==0.4.2`
+# were removed — neither is imported by ANY module in the live import graph
+# (verified by full-tree grep). langchain alone pulls ~150 MB of transitive
+# deps (SQLAlchemy, tenacity, jsonpatch, dataclasses-json…), inflating the
+# container image, Artifact Registry storage, cold-start time, and RAM. The
+# diagnosis pipeline talks to Gemini directly via utils/gemini_api_manager.py.
 
 # PDF Generation & Reports
+# NOTE: PDFs are generated CLIENT-SIDE (Frontend/src/utils/jsonToPdf.ts); the
+# deployed backend (app.py) imports no PDF library. `xhtml2pdf==0.2.13` was
+# removed (zero references anywhere). `reportlab`/`fpdf` are retained for now
+# because legacy pdf_generator_*.py / helper_functions still reference them —
+# safe to drop once those unused modules are deleted.
 reportlab==4.0.9
-xhtml2pdf==0.2.13
 fpdf==1.7.2
 jinja2==3.1.3
 

@@ -39,14 +39,47 @@ def _is_protected(user: dict) -> bool:
     return bool(user.get("is_permanent_admin")) or user.get("email") == PERMANENT_ADMIN_EMAIL
 
 
+def _safe_int(value, default: int = 0) -> int:
+    """Coerce a possibly-dirty stored value to int without raising."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _user_with_billing(doc: dict) -> dict:
-    """UserPublic + entitlement balance, for admin tables."""
-    base = UserPublic.from_document(doc).model_dump()
-    base["balance"] = entitlements.get_balance(doc)
-    base["report_credits"] = int(doc.get("report_credits", 0) or 0)
-    base["total_reports"] = int(doc.get("total_reports", 0) or 0)
-    base["subscription"] = doc.get("subscription")
-    return base
+    """UserPublic + entitlement balance, for admin tables.
+
+    Fully defensive: it must never raise, so that a single malformed user
+    document cannot break the entire admin listing (one bad row ⇒ 500 ⇒ the
+    dashboard shows zero users). On unexpected data it returns a minimal, safe
+    row and logs the offending id for follow-up.
+    """
+    doc = doc or {}
+    try:
+        base = UserPublic.from_document(doc).model_dump()
+        base["balance"] = entitlements.get_balance(doc)
+        base["report_credits"] = _safe_int(doc.get("report_credits", 0))
+        base["total_reports"] = _safe_int(doc.get("total_reports", 0))
+        base["subscription"] = doc.get("subscription")
+        return base
+    except Exception as e:  # pragma: no cover - defensive last resort
+        uid = str(doc.get("_id") or doc.get("id") or "")
+        logger.error("Failed to serialize user %s for admin listing: %s", uid, e)
+        return {
+            "id": uid,
+            "name": str(doc.get("name") or ""),
+            "email": str(doc.get("email") or ""),
+            "role": "user",
+            "is_active": bool(doc.get("is_active", True)),
+            "is_verified": bool(doc.get("is_verified", False)),
+            "is_permanent_admin": bool(doc.get("is_permanent_admin", False)),
+            "report_credits": _safe_int(doc.get("report_credits", 0)),
+            "total_reports": _safe_int(doc.get("total_reports", 0)),
+            "subscription": doc.get("subscription"),
+            "balance": None,
+            "_malformed": True,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -55,14 +88,19 @@ def _user_with_billing(doc: dict) -> dict:
 @router.get("/overview")
 async def overview(_admin=Depends(get_current_admin)):
     """High-level metrics for the admin dashboard home."""
-    users, total_users = await user_service.list_users(page=1, limit=1)
     _p, total_payments, revenue = await payments.list_payments(page=1, limit=1, status="paid")
     stats = await entitlements.usage_stats(days=14)
     active_plans = await plans.list_plans(active_only=True)
 
-    # Count users holding credits / on a pack.
-    all_users, _ = await user_service.list_users(page=1, limit=100)
-    subscribers = sum(1 for u in all_users if int(u.get("report_credits", 0) or 0) > 0)
+    # User counts via cheap indexed count queries (no document paging). Best
+    # effort: a transient DB blip degrades these KPIs to 0 rather than 500-ing
+    # the whole overview card.
+    try:
+        total_users = await user_service.count_users()
+        subscribers = await user_service.count_users(with_credits=True)
+    except user_service.DatabaseUnavailable:
+        total_users = 0
+        subscribers = 0
 
     return {
         "success": True,
@@ -90,7 +128,13 @@ async def list_users(
     search: Optional[str] = Query(None),
     _admin=Depends(get_current_admin),
 ):
-    users, total = await user_service.list_users(page=page, limit=limit, search=search)
+    try:
+        users, total = await user_service.list_users(page=page, limit=limit, search=search)
+    except user_service.DatabaseUnavailable:
+        raise HTTPException(
+            status_code=503,
+            detail="User directory is temporarily unavailable. Please retry in a moment.",
+        )
     return {
         "success": True,
         "total": total,
@@ -152,6 +196,21 @@ async def adjust_credits(user_id: str, payload: AdjustCreditsRequest, _admin=Dep
         raise HTTPException(status_code=404, detail="User not found")
     logger.info("Admin adjusted credits for %s: %+d -> %d (%s)",
                 user.get("email"), payload.delta, int(updated.get("report_credits", 0) or 0), payload.reason or "")
+
+    # Only a genuine grant (positive delta) is a "congratulations" moment for
+    # the user — a negative delta is a deduction/correction, which does not
+    # warrant one. Best-effort: an email hiccup must never fail the credit
+    # adjustment itself, which has already been committed above.
+    if payload.delta > 0:
+        try:
+            await email_service.send_credits_granted(
+                updated.get("email", ""), updated.get("name", ""),
+                int(payload.delta), int(updated.get("report_credits", 0) or 0),
+                reason=payload.reason,
+            )
+        except Exception as e:
+            logger.error("Credit-grant congratulations email failed: %s", e)
+
     return {"success": True, "user": _user_with_billing(updated)}
 
 
@@ -174,6 +233,12 @@ async def list_all_payments(
 
 def _admin_email(admin: dict) -> Optional[str]:
     return admin.get("email") if isinstance(admin, dict) else None
+
+
+def _admin_name(admin: dict) -> Optional[str]:
+    # The legacy env-admin token only carries `email`/`role` claims (no `name`),
+    # while a DB admin user's token includes `name` — handle both.
+    return admin.get("name") if isinstance(admin, dict) else None
 
 
 @router.post("/payments/{order_id}/approve")
@@ -246,6 +311,21 @@ async def grant_plan(user_id: str, payload: GrantPlanRequest, admin=Depends(get_
         )
     except Exception as e:
         logger.error("Grant email failed: %s", e)
+
+    # Confirmation receipt to the admin who performed the grant — kept in a
+    # separate try/except so a failure here never masks or blocks the
+    # user-facing email above (the grant itself has already been committed).
+    try:
+        admin_email_addr = _admin_email(admin)
+        if admin_email_addr:
+            await email_service.send_admin_grant_confirmation(
+                admin_email_addr, _admin_name(admin),
+                target.get("name", ""), target.get("email", ""),
+                plan.get("name", "plan"), int(plan.get("credits", 0)),
+                order["order_id"],
+            )
+    except Exception as e:
+        logger.error("Grant admin-confirmation email failed: %s", e)
 
     fresh = await user_service.get_user_by_id(user_id)
     return {"success": True, "user": _user_with_billing(fresh), "order_id": order["order_id"]}

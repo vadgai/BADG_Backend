@@ -412,7 +412,13 @@ async def admin_list_users(
     _admin: dict = Depends(require_admin),
 ):
     """List users (admin only)."""
-    users, total = await user_service.list_users(page=page, limit=limit, search=search)
+    try:
+        users, total = await user_service.list_users(page=page, limit=limit, search=search)
+    except user_service.DatabaseUnavailable:
+        raise HTTPException(
+            status_code=503,
+            detail="User directory is temporarily unavailable. Please retry in a moment.",
+        )
     return UserListResponse(
         total=total,
         page=page,

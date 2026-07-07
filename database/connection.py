@@ -157,8 +157,20 @@ def get_database() -> Optional[AsyncIOMotorDatabase]:
 
 
 def is_database_available() -> bool:
-    """Check if database is available"""
+    """Check if database is available (driver present AND currently connected)."""
     return _db_available
+
+
+def is_database_configured() -> bool:
+    """Whether a MongoDB connection is *configured* (driver available + URI set),
+    regardless of whether it is currently connected.
+
+    Lets callers tell an outage ("DB is configured but temporarily unreachable")
+    apart from genuine no-database dev mode ("no MONGO_URI at all"). The former
+    should surface a retryable error rather than silently degrade to the empty
+    in-memory store — critical for read paths like the admin user list, where a
+    false-empty result reads as "all users disappeared"."""
+    return bool(MOTOR_AVAILABLE and MONGO_URI)
 
 
 async def create_indexes():

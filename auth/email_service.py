@@ -351,3 +351,50 @@ async def send_purchase_rejected(to_email: str, name: str, plan_name: str, reaso
         + f" Contact {SUPPORT_EMAIL} with your payment reference for help.\n\n- VADG"
     )
     return await _send(to_email, subject, html, text)
+
+
+async def send_credits_granted(
+    to_email: str, name: str, credits_added: int, new_balance: int, reason: Optional[str] = None,
+) -> bool:
+    """Congratulate a user on report credits an admin granted them directly
+    (support comp, goodwill gesture, correction) — distinct from
+    send_purchase_approved, which follows an actual plan purchase/request."""
+    subject = "You've received free report credits"
+    reason_line = f"<br><br><strong>Note:</strong> {reason}" if reason else ""
+    reason_text = f"\nNote: {reason}" if reason else ""
+    html = _wrap(
+        "Free credits added",
+        f"Hi {name or 'there'},<br><br>Congratulations! You've received "
+        f"<strong>{credits_added} free report credit(s)</strong> from the VADG team."
+        f"{reason_line}<br><br>"
+        f"Your available report credits: <strong>{new_balance}</strong>.",
+        cta_text="Start an assessment",
+        cta_url=f"{FRONTEND_URL}/vadg-ai-diagnosis",
+    )
+    text = (
+        f"Hi {name or 'there'},\n\nCongratulations! You've received {credits_added} "
+        f"free report credit(s) from the VADG team.{reason_text}\n"
+        f"Available credits: {new_balance}.\n\n- VADG"
+    )
+    return await _send(to_email, subject, html, text)
+
+
+async def send_admin_grant_confirmation(
+    admin_email: str, admin_name: Optional[str], user_name: str, user_email: str,
+    plan_name: str, credits: int, order_id: str,
+) -> bool:
+    """Confirm to the admin who granted a plan that it was applied successfully."""
+    display_user = user_name or user_email
+    subject = f"Confirmed: {plan_name} granted to {display_user}"
+    body = (
+        f"Hi {admin_name or 'Admin'},<br><br>This confirms you granted the "
+        f"<strong>{plan_name}</strong> plan to <strong>{display_user}</strong> "
+        f"({user_email}).<br><br>"
+        f"<strong>Credits granted:</strong> {credits}<br>"
+        f"<strong>Order ID:</strong> {order_id}"
+    )
+    text = (
+        f"Hi {admin_name or 'Admin'},\n\nConfirmed: you granted the {plan_name} plan to "
+        f"{display_user} ({user_email}).\nCredits granted: {credits}\nOrder ID: {order_id}"
+    )
+    return await _send(admin_email, subject, _wrap(subject, body), text)

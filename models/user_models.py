@@ -162,10 +162,19 @@ class AdminUpdateStatusRequest(BaseModel):
 # Response models
 # ---------------------------------------------------------------------------
 class UserPublic(BaseModel):
-    """Safe, public-facing representation of a user (never exposes secrets)."""
+    """Safe, public-facing representation of a user (never exposes secrets).
+
+    NOTE: `email` is a plain `str` here, NOT `EmailStr`. This is a *display*
+    model built from data already in the database — strict re-validation on read
+    is the wrong place for it. If a single stored document ever held a malformed
+    email (legacy import, direct DB edit, etc.), an `EmailStr` field would raise
+    and take down the ENTIRE admin user list (one bad row ⇒ 500, dashboard shows
+    zero users). Input is still strictly validated at write time by
+    `RegisterRequest`/`LoginRequest`.
+    """
     id: str
     name: str
-    email: EmailStr
+    email: str
     role: UserRole = UserRole.USER
     is_active: bool = True
     is_verified: bool = False
@@ -177,15 +186,25 @@ class UserPublic(BaseModel):
 
     @staticmethod
     def from_document(doc: Dict[str, Any]) -> "UserPublic":
-        """Build a UserPublic from a raw MongoDB document."""
+        """Build a UserPublic from a raw MongoDB document.
+
+        Defensive by design: it must never raise on realistic dirty data, so
+        that one corrupt user record cannot break the admin listing. Unknown
+        roles are coerced to ``user`` and all fields fall back to safe defaults.
+        """
+        doc = doc or {}
+
+        raw_role = doc.get("role")
+        role = raw_role if raw_role in (UserRole.USER.value, UserRole.ADMIN.value) else UserRole.USER.value
+
         return UserPublic(
-            id=str(doc.get("_id")),
-            name=doc.get("name", ""),
-            email=doc.get("email", ""),
-            role=doc.get("role", UserRole.USER),
-            is_active=doc.get("is_active", True),
-            is_verified=doc.get("is_verified", False),
-            is_permanent_admin=doc.get("is_permanent_admin", False),
+            id=str(doc.get("_id") or doc.get("id") or ""),
+            name=str(doc.get("name") or ""),
+            email=str(doc.get("email") or ""),
+            role=role,
+            is_active=bool(doc.get("is_active", True)),
+            is_verified=bool(doc.get("is_verified", False)),
+            is_permanent_admin=bool(doc.get("is_permanent_admin", False)),
             phone=doc.get("phone"),
             avatar_url=doc.get("avatar_url"),
             created_at=doc.get("created_at"),

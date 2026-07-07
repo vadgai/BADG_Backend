@@ -19,6 +19,7 @@ Document shape (auth_users):
 """
 
 import logging
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,12 +40,21 @@ except Exception:  # pragma: no cover - pymongo always ships with motor
     ReturnDocument = None
 
 try:
-    from database.connection import get_database, is_database_available
+    from database.connection import (
+        get_database,
+        is_database_available,
+        is_database_configured,
+        wait_if_connecting,
+    )
 except Exception:  # pragma: no cover - fallback for unusual import paths
     def get_database():
         return None
     def is_database_available():
         return False
+    def is_database_configured():
+        return False
+    async def wait_if_connecting(timeout: float = 8.0):
+        return None
 
 from auth.tokens import hash_refresh_token
 
@@ -52,6 +62,14 @@ COLLECTION = "auth_users"
 
 # In-memory fallback store: { id: user_dict }
 _mem_users: Dict[str, Dict[str, Any]] = {}
+
+
+class DatabaseUnavailable(RuntimeError):
+    """Raised when the user store is configured (MONGO_URI set) but the database
+    is not currently reachable. Callers should translate this into a retryable
+    503 rather than treating it as "no users" — otherwise a transient DB outage
+    would render as an empty admin user list (looks like every account vanished).
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -413,22 +431,40 @@ async def revoke_all_sessions(user_id: str) -> bool:
 # ---------------------------------------------------------------------------
 # Admin listing
 # ---------------------------------------------------------------------------
+def _build_search_query(search: Optional[str]) -> Dict[str, Any]:
+    """Case-insensitive name/email search filter. The user input is escaped so
+    regex metacharacters (`.`, `*`, `(`, …) are matched literally rather than
+    interpreted — both a correctness fix (a search for "a.b" shouldn't match
+    "axb") and a guard against a pathological/ReDoS-y pattern reaching MongoDB."""
+    if not search or not search.strip():
+        return {}
+    s = re.escape(search.strip())
+    return {"$or": [
+        {"email": {"$regex": s, "$options": "i"}},
+        {"name": {"$regex": s, "$options": "i"}},
+    ]}
+
+
 async def list_users(
     page: int = 1, limit: int = 20, search: Optional[str] = None
 ) -> Tuple[List[Dict[str, Any]], int]:
-    """Return (users, total) for the admin dashboard, newest first."""
+    """Return (users, total) for the admin dashboard, newest first.
+
+    Raises DatabaseUnavailable when a database is configured but currently
+    unreachable, so the caller can report a retryable error instead of an
+    empty list.
+    """
     page = max(1, page)
     limit = max(1, min(limit, 100))
     skip = (page - 1) * limit
-    col = _collection()
 
-    query: Dict[str, Any] = {}
-    if search:
-        s = search.strip()
-        query = {"$or": [
-            {"email": {"$regex": s, "$options": "i"}},
-            {"name": {"$regex": s, "$options": "i"}},
-        ]}
+    # Ride out the cold-start window: on Cloud Run the app serves traffic before
+    # the background MongoDB connect finishes, so the first admin request could
+    # otherwise fall through to the (empty) in-memory store and show "no users".
+    await wait_if_connecting()
+
+    col = _collection()
+    query = _build_search_query(search)
 
     if col is not None:
         total = await col.count_documents(query)
@@ -436,11 +472,37 @@ async def list_users(
         users = await cursor.to_list(length=limit)
         return users, total
 
-    # In-memory fallback
+    # No live collection. A configured-but-unreachable DB is an outage, not an
+    # empty user base — surface it rather than silently returning in-memory data.
+    if is_database_configured():
+        raise DatabaseUnavailable("User store is temporarily unavailable")
+
+    # Genuine no-database dev mode → in-memory fallback.
     items = list(_mem_users.values())
-    if search:
+    if search and search.strip():
         s = search.strip().lower()
         items = [u for u in items if s in u.get("email", "").lower() or s in u.get("name", "").lower()]
     items.sort(key=lambda u: u.get("created_at") or datetime.min, reverse=True)
     total = len(items)
     return items[skip:skip + limit], total
+
+
+async def count_users(*, with_credits: bool = False) -> int:
+    """Count users (optionally only those holding report credits).
+
+    A single indexed count query — far cheaper than paging a sample of documents
+    into the app just to tally them. Raises DatabaseUnavailable on a configured
+    but unreachable database.
+    """
+    await wait_if_connecting()
+    col = _collection()
+    if col is not None:
+        query = {"report_credits": {"$gt": 0}} if with_credits else {}
+        return await col.count_documents(query)
+
+    if is_database_configured():
+        raise DatabaseUnavailable("User store is temporarily unavailable")
+
+    if with_credits:
+        return sum(1 for u in _mem_users.values() if int(u.get("report_credits", 0) or 0) > 0)
+    return len(_mem_users)
